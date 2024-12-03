@@ -2,9 +2,10 @@ import os
 from dask.distributed import Client, LocalCluster
 
 from load_data import preprocess_and_save_zarr, get_zarr_splits
-from test_gnn import test_gnn, compute_zarr_dataset_hash,\
+from io_utils import compute_zarr_dataset_hash,\
     load_normalisation_cache, save_normalisation_cache,\
     compute_normalisation_params
+from test_gnn import test_gnn
 
 START_YEAR = 1979
 END_YEAR = 2020
@@ -61,6 +62,7 @@ def main():
             save_normalisation_cache(dataset_hash, means, stds,
                                      NORMALISATION_CACHE_PATH)
         
+        print("Testing WeatherGNN")
         # Test WeatherGNN
         test_gnn(splits, means, stds)
         

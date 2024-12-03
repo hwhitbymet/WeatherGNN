@@ -29,29 +29,35 @@ def test_gnn(splits, means, stds):
     means_jax = jnp.stack([jnp.array(means[var]) for var in training_data.keys()])
     stds_jax = jnp.stack([jnp.array(stds[var]) for var in training_data.keys()])
     
-    # Wrap the model creation in a Haiku transform
-    def create_model(x):  # Add input argument
+    # Wrap ONLY the encoder creation in a Haiku transform
+    def create_encoder(x):
         model = WeatherGNN(output_var=output_var)
-        return model(x)
+        encoder = model.encoder
+        
+        # Set normalization parameters before returning
+        encoder.set_normalization_params(means_jax, stds_jax)
+        
+        # Directly return the encoder's output
+        return encoder(x)
     
-    # Create Haiku transformed model
-    init_fn = hk.transform(create_model)
+    # Create Haiku transformed encoder
+    init_fn = hk.transform(create_encoder)
     
     # Use a fixed random key for initialization
     rng = jax.random.PRNGKey(42)
     
-    # Initialize the model with the training data
-    model_params = init_fn.init(rng, training_data)
+    # Initialize the encoder with the training data
+    encoder_params = init_fn.init(rng, training_data)
     
     try:
         # Create an apply function
         apply_fn = init_fn.apply
         
-        # Set normalization parameters
-        model_params.encoder.set_normalization_params(means_jax, stds_jax)
+        # Set normalization parameters directly on the encoder
+        encoder_params.set_normalization_params(means_jax, stds_jax)
         
-        # Call the model to create graph representation
-        graph = apply_fn(model_params, rng, training_data)
+        # Call the encoder to create graph representation
+        graph = apply_fn(encoder_params, rng, training_data)
         
         # Print graph details
         print("\nGraph Information:")
