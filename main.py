@@ -12,7 +12,7 @@ from typing import Dict, Tuple
 from load_data import preprocess_and_save_zarr
 from io_utils import get_zarr_splits
 from training_utils import *
-from weather_gnn import WeatherPrediction
+from weather_gnn import WeatherPrediction, ModelConfig
 
 START_YEAR = 1979
 END_YEAR = 2020
@@ -110,8 +110,9 @@ def main():
             init_data = pickle.load(handle)
     
     print("Initialising parameters")
+    config = ModelConfig()
     # Initialise parameters
-    params = model.init(rng, init_data)
+    params = model.init(rng, init_data, config)
     
     print ("Creating optimiser...")
     # Create optimiser
