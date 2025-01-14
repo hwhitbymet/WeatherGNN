@@ -6,6 +6,7 @@ import jraph
 import numpy as np
 import jax.numpy as jnp
 import haiku as hk
+import pickle
 from typing import Dict, Tuple
 
 from load_data import preprocess_and_save_zarr
@@ -20,7 +21,7 @@ VALIDATION_YEARS = [1991, 2004, 2017]
 TESTING_YEARS =[2012, 2016, 2020]
 
 ZARR_DATASET_PATH = "./ERA5_data/zarr/full_dataset.zarr"
-NORMALISATION_CACHE_PATH = "./cache/normalisation_cache.json"
+INIT_PARAMS_CACHE = "./cache/init_params.pkl"
 
 # https://docs.python.org/3/library/os.html/#os.sched_getaffinity
 # NUM_WORKERS = len(os.sched_getaffinity(0))
@@ -91,8 +92,22 @@ def main():
     model = create_forward_fn()
     
     print("Calculating single timestep data for initialisation...")
-    init_data = compute_with_logging(
-        {var: splits['train'][var][0] for var in splits['train'].keys()})
+    # If a precomputed cache for initialisation data can't be found...
+    if not os.path.exists(INIT_PARAMS_CACHE):
+        # Get the parent directory of the specified initialisation data cache file
+        init_params_cache_folder = ''.join(INIT_PARAMS_CACHE.split('/')[:-1])
+        if not os.path.exists(init_params_cache_folder):
+            os.makedirs(init_params_cache_folder)
+        # Compute the initialisation data
+        init_data = compute_with_logging(
+            {var: splits['train'][var][0] for var in splits['train'].keys()})
+        # Write the initialisation data to file
+        with open (INIT_PARAMS_CACHE, 'wb') as handle:
+            pickle.dump (init_data, handle)
+    # If a precomputed cache for initialisation data can be found, read from it
+    else:
+        with open (INIT_PARAMS_CACHE, 'wb') as handle:
+            init_data = pickle.load(handle)
     
     print("Initialising parameters")
     # Initialise parameters
