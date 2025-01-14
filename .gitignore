@@ -1,0 +1,6 @@
+ERA5_data
+.cdsapivenv/
+__pycache__/
+ERA5_data/*
+cache/*
+.venv/
