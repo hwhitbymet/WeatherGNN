@@ -2,7 +2,6 @@ import logging
 import time
 import jax
 import jax.numpy as jnp
-import jraph
 import optax
 import os
 import haiku as hk
@@ -20,11 +19,52 @@ def create_forward_fn(config, rng_key):
         model = WeatherPrediction(config, rng_key)
         return model(latlon_data)
     
-    return hk.transform(forward_fn)
+    return hk.without_apply_rng(hk.transform(forward_fn))
+
+def create_train_step(forward_fn, optimizer):
+    """
+    Create a single training step function
+    
+    Args:
+        forward_fn: Haiku transformed forward function
+        optimizer: Optax optimizer
+    
+    Returns:
+        Jitted training step function
+    """
+    def train_step(params, rng, input_data, target_data):
+        """
+        Single training step
+        
+        Args:
+            params: Model parameters
+            rng: Random number generator
+            input_data: Input data for current timestep
+            target_data: Ground truth for next timestep
+        
+        Returns:
+            Tuple of (updated params, loss)
+        """
+        def loss_fn(params):
+            # Note: forward_fn.apply no longer needs state
+            pred = forward_fn.apply(params, input_data)
+            return compute_loss(pred, target_data)
+        
+        # Compute gradients
+        grad_fn = jax.value_and_grad(loss_fn)
+        loss, grads = grad_fn(params)
+        
+        # Update parameters
+        updates, _ = optimizer.update(grads, None)
+        updated_params = optax.apply_updates(params, updates)
+        
+        return updated_params, loss
+    
+    return jax.jit(train_step)
 
 def train(
     config: Configuration, 
-    model: hk.TransformedWithState,
+    model: hk.Transformed,  # Changed from TransformedWithState
     params: dict, 
     splits: dict
 ):
@@ -115,7 +155,8 @@ def train(
             target_data = {var: val_data[var][t+1] for var in val_data}
             
             # Compute validation loss (without gradient updates)
-            pred = model.apply(params, rng, input_data)
+            # Note: apply no longer needs state
+            pred = model.apply(params, input_data)
             loss = compute_loss(pred, target_data)
             val_loss += loss
             
@@ -153,46 +194,6 @@ def train(
     
     return params
 
-def create_train_step(forward_fn, optimizer):
-    """
-    Create a single training step function
-    
-    Args:
-        forward_fn: Haiku transformed forward function
-        optimizer: Optax optimizer
-    
-    Returns:
-        Jitted training step function
-    """
-    def train_step(params, rng, input_data, target_data):
-        """
-        Single training step
-        
-        Args:
-            params: Model parameters
-            rng: Random number generator
-            input_data: Input data for current timestep
-            target_data: Ground truth for next timestep
-        
-        Returns:
-            Tuple of (updated params, loss)
-        """
-        def loss_fn(params):
-            pred = forward_fn.apply(params, rng, input_data)
-            return compute_loss(pred, target_data)
-        
-        # Compute gradients
-        grad_fn = jax.value_and_grad(loss_fn)
-        loss, grads = grad_fn(params)
-        
-        # Update parameters
-        updates, _ = optimizer.update(grads, None)
-        updated_params = optax.apply_updates(params, updates)
-        
-        return updated_params, loss
-    
-    return jax.jit(train_step)
-
 def compute_loss(pred: jnp.ndarray, target: jnp.ndarray) -> jnp.ndarray:
     """
     Compute Mean Squared Error loss between prediction and ground truth
@@ -206,7 +207,7 @@ def compute_loss(pred: jnp.ndarray, target: jnp.ndarray) -> jnp.ndarray:
     """
     return jnp.mean(jnp.square(pred - target))
 
-def main(config_path: str):
+def main(config_path: str, dataset_path:str):
     # Setup logging
     log_dir = "logs"
     os.makedirs(log_dir, exist_ok=True)
@@ -227,9 +228,15 @@ def main(config_path: str):
     # Load configuration
     config = Configuration.load(config_path)
     
+    dataset = config.data.zarr_dataset_path if dataset_path is None else dataset_path
+    
     # Get data splits
     logging.info("Loading data splits...")
-    splits = get_data_splits(config)
+    splits = get_data_splits(dataset,
+                             config.data.splits_cache_dir,
+                             config.data.train_period,
+                             config.data.test_period,
+                             config.data.validation_period)
     logging.info("Data splits loaded successfully")
     
     # Initialize model
@@ -242,7 +249,8 @@ def main(config_path: str):
     if not os.path.exists(config.data.init_params_cache):
         init_data = {var: splits['train'][var][0][:] 
                      for var in splits['train'].keys()}
-        params = model.init(rng, init_data, config.model)
+        # params = model.init(rng, init_data, config.model)
+        params = model.init(rng, init_data)
         with open(config.data.init_params_cache, 'wb') as f:
             pickle.dump(params, f)
         logging.info(f"Saved initial parameters to {config.data.init_params_cache}")
@@ -269,8 +277,10 @@ def main(config_path: str):
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
-    parser.add_argument('--config', default='config/prototype.yaml')
+    parser.add_argument('--config', default='./config/prototype.yaml')
+    parser.add_argument('--dataset', default='./ERA5_data/zarr/full_dataset.zarr')
+    parser.add_argument('--output_dir', default='./out/')
     parser.add_argument('--log-level', default='INFO',
                       choices=['DEBUG', 'INFO', 'WARNING', 'ERROR', 'CRITICAL'])
     args = parser.parse_args()
-    main(args.config)
+    main(args.config, args.dataset)

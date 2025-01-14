@@ -5,6 +5,7 @@ import haiku as hk
 import jraph
 from tqdm import tqdm
 from dataclasses import dataclass
+from functools import partial
 
 from graph_utils import create_sphere_nodes, create_spatial_nodes, calculate_sphere_node_positions
 
@@ -12,8 +13,7 @@ from graph_utils import create_sphere_nodes, create_spatial_nodes, calculate_sph
 @dataclass
 class ModelConfig:
     """Configuration for the weather prediction model"""
-    # Spatial grid configuration
-    n_lat: int = 721
+    # Spatial grid configuratio: int = 721
     n_lon: int = 1440
     n_pressure_levels: int = 13
     n_variables: int = 6
@@ -34,6 +34,19 @@ class ModelConfig:
     def n_features(self) -> int:
         return self.n_variables * self.n_pressure_levels
 
+
+import jax
+import jax.numpy as jnp
+import jraph
+from functools import partial
+from typing import Tuple
+
+import jax
+import jax.numpy as jnp
+import jraph
+from functools import partial
+
+# @partial(jax.jit, static_argnums=(2, 3, 5, 6))
 def create_bipartite_graph(
     spatial_nodes: jnp.ndarray, 
     sphere_nodes: jnp.ndarray, 
@@ -41,7 +54,7 @@ def create_bipartite_graph(
     n_lon: int,
     rng_key: int,
     max_distance_deg: float = 3.0,
-    target_feature_dim: int = None,
+    target_feature_dim: int = 256,
     is_encoding: bool = True
 ) -> jraph.GraphsTuple:
     """
@@ -138,13 +151,11 @@ def create_bipartite_graph(
             jnp.rad2deg(lon)
         ])
 
-    
-
     logging.info(f"Projecting spatial node features to {target_feature_dim} dimensions")
     # Project node features to target dimensionality
-    spatial_nodes_projected = mlp_project(spatial_nodes, target_feature_dim, rng_key) if target_feature_dim else spatial_nodes
+    spatial_nodes_projected = mlp_project(spatial_nodes, target_feature_dim, rng_key)
     logging.info(f"Projecting edge features to {target_feature_dim} dimensions")
-    sphere_nodes_projected = mlp_project(sphere_nodes, target_feature_dim, rng_key) if target_feature_dim else sphere_nodes
+    # sphere_nodes_projected = mlp_project(sphere_nodes, target_feature_dim, rng_key)
 
     logging.info(f"Calculating co-ordinates of all nodes...")
     # Calculate spatial and sphere node coordinates
@@ -157,7 +168,7 @@ def create_bipartite_graph(
     # Compute pairwise distances and create edge connections
     senders, receivers, edge_features = [], [], []
 
-    for i, (sphere_pos, sphere_node) in enumerate(zip(sphere_coords, sphere_nodes_projected)):
+    for i, (sphere_pos, sphere_node) in enumerate(zip(sphere_coords, sphere_nodes)):
         logging.info(f"Finding neighbours for node {i}")
         # Find nearby spatial nodes
         nearby_indices, _ = find_nearby_nodes(
@@ -189,11 +200,11 @@ def create_bipartite_graph(
     edge_features = jnp.array(edge_features)
     
     return jraph.GraphsTuple(
-        nodes=jnp.concatenate([spatial_nodes_projected, sphere_nodes_projected], axis=0),
+        nodes=jnp.concatenate([spatial_nodes_projected, sphere_nodes], axis=0),
         edges=edge_features,
         senders=senders,
         receivers=receivers,
-        n_node=jnp.array([spatial_nodes_projected.shape[0], sphere_nodes_projected.shape[0]]),
+        n_node=jnp.array([spatial_nodes_projected.shape[0], sphere_nodes.shape[0]]),
         n_edge=jnp.array([len(senders)]),
         globals=None
     )
@@ -206,16 +217,35 @@ def make_mlp(input_size: int, hidden_size: int, output_size: int) -> hk.Sequenti
         hk.Linear(output_size)
     ])
 
-def message_passing_step(config:ModelConfig, graph: jraph.GraphsTuple) -> jraph.GraphsTuple:
-    # Same as encoder message passing
+class MessagePassingWeights(hk.Module):
+    """Module to hold and reuse weights for message passing"""
+    def __init__(self, latent_size: int, name: str = None):
+        super().__init__(name=name)
+        self.latent_size = latent_size
+        
+        # Create MLPs once during initialization
+        self.edge_mlp = hk.Sequential([
+            hk.Linear(latent_size), 
+            jax.nn.relu,
+            hk.LayerNorm(axis=-1, create_scale=True, create_offset=True),
+            hk.Linear(latent_size)
+        ])
+        
+        self.node_mlp = hk.Sequential([
+            hk.Linear(latent_size), 
+            jax.nn.relu,
+            hk.LayerNorm(axis=-1, create_scale=True, create_offset=True),
+            hk.Linear(latent_size)
+        ])
+
+def message_passing_step(weights: MessagePassingWeights, graph: jraph.GraphsTuple) -> jraph.GraphsTuple:
+    """Optimized message passing using pre-initialized weights"""
     senders = graph.nodes[graph.senders]
     receivers = graph.nodes[graph.receivers]
     edge_inputs = jnp.concatenate([graph.edges, senders, receivers], axis=1)
-    updated_edges = make_mlp(
-        edge_inputs.shape[1],
-        config.latent_size,
-        config.latent_size
-    )(edge_inputs)
+    
+    # Use stored weights
+    updated_edges = weights.edge_mlp(edge_inputs)
     
     messages = jraph.segment_sum(
         updated_edges,
@@ -224,150 +254,195 @@ def message_passing_step(config:ModelConfig, graph: jraph.GraphsTuple) -> jraph.
     )
     
     node_inputs = jnp.concatenate([graph.nodes, messages], axis=1)
-    updated_nodes = make_mlp(
-        node_inputs.shape[1],
-        config.latent_size,
-        config.latent_size
-    )(node_inputs)
+    updated_nodes = weights.node_mlp(node_inputs)
     
     return graph._replace(nodes=updated_nodes, edges=updated_edges)
 
+
+class ProcessorCNN(hk.Module):
+    """ProcessorCNN implementing spherical convolutions without stateful caching"""
+    def __init__(self, config: ModelConfig):
+        super().__init__()
+        self.config = config
+        
+        # Initialize convolution layers
+        self.conv_layers = []
+        for i in range(config.num_message_passing_steps):
+            layer = {
+                'w_self': hk.Linear(config.latent_size, name=f'w_self_{i}'),
+                'w_neigh': hk.Linear(config.latent_size, name=f'w_neigh_{i}'),
+                'layer_norm': hk.LayerNorm(
+                    axis=-1,
+                    create_scale=True,
+                    create_offset=True,
+                    name=f'layer_norm_{i}'
+                )
+            }
+            self.conv_layers.append(layer)
+    
+    def __call__(self, sphere_nodes: jnp.ndarray) -> jnp.ndarray:
+        # Calculate neighbor indices for this forward pass
+        neighbor_indices = self._find_sphere_neighbours()
+        current_features = sphere_nodes
+        
+        # Apply convolution steps
+        for layer in self.conv_layers:
+            # Get neighbor features
+            neighbor_features = current_features[neighbor_indices]  # [N, 6, C]
+            
+            # Apply convolution
+            self_transform = layer['w_self'](current_features)
+            neigh_mean = jnp.mean(neighbor_features, axis=1)
+            neigh_transform = layer['w_neigh'](neigh_mean)
+            
+            # Residual connection and normalization
+            current_features = current_features + self_transform + neigh_transform
+            current_features = layer['layer_norm'](current_features)
+            current_features = jax.nn.relu(current_features)
+        
+        return current_features
+    
+    @partial(jax.jit, static_argnums=(0,))
+    def _find_sphere_neighbours(self) -> jnp.ndarray:
+        """Calculate 6 nearest neighbors for each sphere point using a JIT-compiled function"""
+        # Calculate sphere point positions
+        indices = jnp.arange(self.config.n_sphere_points)
+        phi = (1 + jnp.sqrt(5)) / 2
+        
+        theta = 2 * jnp.pi * indices / phi
+        phi_angle = jnp.arccos(1 - 2 * (indices + 0.5) / self.config.n_sphere_points)
+        
+        # Convert to Cartesian coordinates
+        x = jnp.cos(theta) * jnp.sin(phi_angle)
+        y = jnp.sin(theta) * jnp.sin(phi_angle)
+        z = jnp.cos(phi_angle)
+        positions = jnp.stack([x, y, z], axis=1)
+        
+        # Calculate pairwise distances using dot products
+        dot_products = jnp.einsum('ik,jk->ij', positions, positions)
+        dot_products = jnp.clip(dot_products, -1.0, 1.0)
+        distances = jnp.arccos(dot_products)
+        
+        # Find k+1 nearest neighbors (including self)
+        _, neighbor_indices = jax.lax.top_k(-distances, 7)
+        
+        # Remove self from neighbors (first column)
+        return jax.lax.dynamic_slice_in_dim(neighbor_indices, 1, 6, axis=1)
+
+class WeatherPrediction(hk.Module):
+    """Updated WeatherPrediction to use optimized components"""
+    def __init__(self, config: ModelConfig, rng_key):
+        super().__init__()
+        self.config = config
+        self.encoder = EncoderGNN(config)
+        self.processor = ProcessorCNN(config)
+        self.decoder = DecoderGNN(config)
+        self.rng_key = rng_key
+        
+        # Initialize message passing weights
+        self.encoder_mp_weights = MessagePassingWeights(
+            config.latent_size, 
+            name='encoder_mp'
+        )
+        self.decoder_mp_weights = MessagePassingWeights(
+            config.latent_size, 
+            name='decoder_mp'
+        )
+    
+    def __call__(self, latlon_data: dict[str, jnp.ndarray]) -> jnp.ndarray:
+        # Create initial spatial graph
+        spatial_graph = create_spatial_nodes(
+            latlon_data, 
+            self.config.n_lat, 
+            self.config.n_lon, 
+            self.config.n_features
+        )
+        spatial_nodes = spatial_graph.nodes
+        
+        # Create empty sphere graph
+        sphere_graph = create_sphere_nodes(
+            n_points=self.config.n_sphere_points, 
+            latent_dim=self.config.latent_size
+        )
+        
+        # Apply each component with proper weight reuse
+        encoded = self.encoder(
+            spatial_nodes, 
+            sphere_graph, 
+            self.rng_key, 
+            message_weights=self.encoder_mp_weights
+        )
+        processed = self.processor(encoded.nodes)
+        return self.decoder(
+            processed, 
+            self.rng_key, 
+            message_weights=self.decoder_mp_weights
+        )
+
 class EncoderGNN(hk.Module):
-    def __init__(self, config: 'ModelConfig'):
+    def __init__(self, config: ModelConfig):
         super().__init__()
         self.config = config
     
-    def __call__(self, spatial_nodes: jnp.ndarray, sphere_graph: jraph.GraphsTuple, rng_key) -> jraph.GraphsTuple:
-        # Initial projection of spatial nodes to latent space
-        # spatial_projection = hk.Sequential([
-        #     hk.Linear(self.config.latent_size),
-        #     jax.nn.relu,
-        #     hk.LayerNorm(axis=-1, create_scale=True, create_offset=True),
-        #     hk.Linear(self.config.latent_size)
-        # ])(spatial_nodes)
-        
-        
+    def __call__(
+        self, 
+        spatial_nodes: jnp.ndarray, 
+        sphere_graph: jraph.GraphsTuple, 
+        rng_key,
+        message_weights: MessagePassingWeights
+    ) -> jraph.GraphsTuple:
         logging.info("Creating bipartite graph...")
-        # Create bipartite mapping
-        encoder_graph = jax.jit(create_bipartite_graph(
+        
+        # JIT-compile the function itself
+        create_bipartite_graph_jit = jax.jit(
+            create_bipartite_graph, 
+            static_argnums=(2, 3, 6)
+        )
+        
+        # Create encoder graph
+        encoder_graph = create_bipartite_graph_jit(
             spatial_nodes,
             sphere_graph.nodes,
             self.config.n_lat,
             self.config.n_lon,
             rng_key,
             target_feature_dim=256
-        ), static_argnums=(2,3))
+        )
+        
         logging.info("Bipartite graph created. Applying message passing...")
         
-        # Apply message passing steps
+        # Apply message passing steps using provided weights
         for _ in range(self.config.num_message_passing_steps):
-            encoder_graph = self._message_passing_step(encoder_graph)
+            encoder_graph = message_passing_step(message_weights, encoder_graph)
         
         # Extract and return updated sphere nodes
         return sphere_graph._replace(
             nodes=encoder_graph.nodes[self.config.n_spatial_nodes:]
         )
-    
-    def _message_passing_step(self, graph: jraph.GraphsTuple) -> jraph.GraphsTuple:
-        # Get node features for message computation
-        senders = graph.nodes[graph.senders]
-        receivers = graph.nodes[graph.receivers]
-        
-        # Compute messages using node features and displacement vectors
-        edge_inputs = jnp.concatenate([graph.edges, senders, receivers], axis=1)
-        messages = hk.Sequential([
-            hk.Linear(self.config.latent_size),
-            jax.nn.relu,
-            hk.LayerNorm(axis=-1, create_scale=True, create_offset=True),
-            hk.Linear(self.config.latent_size)
-        ])(edge_inputs)
-        
-        # Aggregate messages at receiver nodes
-        aggregated = jraph.segment_sum(
-            messages,
-            graph.receivers,
-            graph.n_node[0]
-        )
-        
-        # Update node features
-        node_inputs = jnp.concatenate([graph.nodes, aggregated], axis=1)
-        updated_nodes = hk.Sequential([
-            hk.Linear(self.config.latent_size),
-            jax.nn.relu,
-            hk.LayerNorm(axis=-1, create_scale=True, create_offset=True),
-            hk.Linear(self.config.latent_size)
-        ])(node_inputs)
-        
-        return graph._replace(nodes=updated_nodes)
-
-class ProcessorCNN(hk.Module):
-    def __init__(self, config: ModelConfig):
-        super().__init__()
-        self.config = config
-        
-    def __call__(self, sphere_nodes: jnp.ndarray) -> jnp.ndarray:
-        # Create hexagonal connectivity
-        neighbor_indices = self._find_sphere_neighbours()
-        current_features = sphere_nodes
-        
-        # Apply convolution steps
-        for _ in range(self.config.num_message_passing_steps):
-            # Get neighbor features
-            neighbor_features = current_features[neighbor_indices]  # [N, 6, C]
-            
-            # Create convolution weights
-            w_self = hk.Linear(self.config.latent_size)
-            w_neigh = hk.Linear(self.config.latent_size)
-            
-            # Apply convolution
-            self_transform = w_self(current_features)
-            neigh_mean = jnp.mean(neighbor_features, axis=1)
-            neigh_transform = w_neigh(neigh_mean)
-            
-            # Residual connection and normalization
-            current_features = current_features + self_transform + neigh_transform
-            current_features = hk.LayerNorm(
-                axis=-1,
-                create_scale=True,
-                create_offset=True
-            )(current_features)
-            current_features = jax.nn.relu(current_features)
-        
-        return current_features
-    
-    def _find_sphere_neighbours(self) -> jnp.ndarray:
-        """Calculate 6 nearest neighbors for each sphere point"""
-        phi = (1 + jnp.sqrt(5)) / 2
-        indices = jnp.arange(self.config.n_sphere_points)
-        
-        theta = 2 * jnp.pi * indices / phi
-        phi_angle = jnp.arccos(1 - 2 * (indices + 0.5) / self.config.n_sphere_points)
-        
-        x = jnp.cos(theta) * jnp.sin(phi_angle)
-        y = jnp.sin(theta) * jnp.sin(phi_angle)
-        z = jnp.cos(phi_angle)
-        positions = jnp.stack([x, y, z], axis=1)
-        
-        # Find 7 nearest neighbors (including self)
-        dot_products = jnp.einsum('ik,jk->ij', positions, positions)
-        dot_products = jnp.clip(dot_products, -1.0, 1.0)
-        distances = jnp.arccos(dot_products)
-        
-        _, neighbor_indices = jax.lax.top_k(-distances, 7)
-        return neighbor_indices[:, 1:]  # Remove self from neighbors
 
 class DecoderGNN(hk.Module):
     def __init__(self, config: ModelConfig):
         super().__init__()
         self.config = config
     
-    def __call__(self, sphere_nodes: jnp.ndarray, rng_key) -> jnp.ndarray:
+    def __call__(
+        self, 
+        sphere_nodes: jnp.ndarray, 
+        rng_key,
+        message_weights: MessagePassingWeights
+    ) -> jnp.ndarray:
         # Initialize empty spatial nodes
         spatial_nodes = jnp.zeros(
             (self.config.n_spatial_nodes, self.config.latent_size)
         )
 
-        decoder_graph = jax.jit(create_bipartite_graph(
+        # Create decoder graph
+        create_bipartite_graph_jit = jax.jit(
+            create_bipartite_graph, 
+            static_argnums=(2, 3)
+        )
+        
+        decoder_graph = create_bipartite_graph_jit(
             spatial_nodes,
             sphere_nodes,
             self.config.n_lat,
@@ -375,12 +450,11 @@ class DecoderGNN(hk.Module):
             rng_key,
             is_encoding=False,
             target_feature_dim=256
-        ), static_argnums=(2,3))
+        )
         
-        
-        # Apply message passing
+        # Apply message passing with provided weights
         for _ in range(self.config.num_message_passing_steps):
-            decoder_graph = message_passing_step(self.config, decoder_graph)
+            decoder_graph = message_passing_step(message_weights, decoder_graph)
         
         # Project spatial nodes back to original feature space
         spatial_nodes = decoder_graph.nodes[:self.config.n_spatial_nodes]
@@ -389,37 +463,3 @@ class DecoderGNN(hk.Module):
             self.config.latent_size,
             self.config.n_features
         )(spatial_nodes)
-    
-
-class WeatherPrediction(hk.Module):
-    def __init__(self, config: ModelConfig, rng_key):
-        super().__init__()
-        self.config = config
-        self.encoder = EncoderGNN(config)
-        self.processor = ProcessorCNN(config)
-        self.decoder = DecoderGNN(config)
-        self.rng_key = rng_key
-    
-    def __call__(self, latlon_data: dict[str, jnp.ndarray]) -> jnp.ndarray:
-        # Create initial spatial graph
-        spatial_graph = create_spatial_nodes(latlon_data, self.config.n_lat, self.config.n_lon, self.config.n_features)
-        spatial_nodes = spatial_graph.nodes
-        
-        # Create empty sphere graph
-        sphere_graph = create_sphere_nodes(n_points=self.config.n_sphere_points, latent_dim=self.config.latent_size)
-        
-        # Apply each component
-        encoded = self.encoder(spatial_nodes, sphere_graph, self.rng_key)
-        processed = self.processor(encoded.nodes)
-        return self.decoder(processed, self.rng_key)
-    
-    def _prepare_spatial_nodes(self, latlon_data: dict[str, jnp.ndarray]) -> jnp.ndarray:
-        """Convert dict of arrays into single node feature array"""
-        features = []
-        for var in sorted(latlon_data.keys()):
-            var_data = latlon_data[var]
-            # Reshape (pressure_levels, lat, lon) to (lat*lon, pressure_levels)
-            reshaped = var_data.transpose(1, 2, 0).reshape(-1, self.config.n_pressure_levels)
-            features.append(reshaped)
-        return jnp.concatenate(features, axis=1)
-    

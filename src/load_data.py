@@ -70,24 +70,28 @@ def load_netcdf_to_zarr(start_year: int, end_year: int, zarr_path: str, num_work
         logging.info("Closing Dask cluster")
         cluster.close()
 
-def get_data_splits(config) -> dict:
-    cache_path = os.path.join(config.data.splits_cache_dir, 'data_splits.pickle')
+def get_data_splits(dataset_path,
+                    cache_path,
+                    train_period:dict,
+                    test_period:dict,
+                    validation_period:dict,
+                    ) -> dict:
     
     # Try loading from cache first
     if os.path.exists(cache_path):
         logging.info(f"Loading data splits from cache: {cache_path}")
-        with open(cache_path, 'rb') as f:
+        with open(f'{cache_path}/data_splits.pickle', 'rb') as f:
             return pickle.load(f)
     
-    logging.info(f"Loading data splits from {config.data.zarr_dataset_path}")
-    store = zarr.open(config.data.zarr_dataset_path, mode='r')
+    logging.info(f"Loading data splits from {dataset_path}")
+    store = zarr.open(dataset_path, mode='r')
     
     splits = {}
-    for split_name in ['train', 'validation', 'test']:
-        period = getattr(config.data, f"{split_name}_period")
-        logging.info(f"Processing {split_name} split for period {period['start']} to {period['end']}")
+    for split in [train_period, validation_period, test_period]:
+        split_name = split['name']
+        logging.info(f"Processing {split_name} split for period {split['start']} to {split['end']}")
         
-        indices = get_period_indices(period)
+        indices = get_period_indices(split)
         logging.info(f"Generated {len(indices)} indices for {split_name} split")
         
         # Compute and store the actual data instead of just references
@@ -99,9 +103,9 @@ def get_data_splits(config) -> dict:
         logging.info(f"{split_name.capitalize()} split: {len(splits[split_name])} variables, shape {first_var.shape}")
     
     # Save to cache
-    os.makedirs(config.data.splits_cache_dir, exist_ok=True)
+    os.makedirs(cache_path, exist_ok=True)
     logging.info(f"Saving data splits to cache: {cache_path}")
-    with open(cache_path, 'wb') as f:
+    with open(f'{cache_path}/data_splits.pickle', 'wb') as f:
         pickle.dump(splits, f)
     
     return splits

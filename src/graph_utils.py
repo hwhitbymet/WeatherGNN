@@ -1,8 +1,8 @@
-import jax
 import jax.numpy as jnp
 import jraph
 from typing import Optional
 from functools import lru_cache
+import logging
 
 def create_sphere_nodes(
     n_points: int,
@@ -53,18 +53,20 @@ def create_spatial_nodes(
     n_nodes = n_lat * n_lon
     
     if data_dict is not None:
+        logging.info(f"n_features = {n_features}")
+        logging.info(f"len(data_dict) = {len(data_dict)}")
         features = []
         expected_var_features = n_features // len(data_dict)
         
-        print(f"Creating spatial graph with:")
-        print(f"- Target nodes: {n_nodes} (n_lat: {n_lat} × n_lon: {n_lon})")
-        print(f"- Features per variable: {expected_var_features}")
-        print(f"- Total features: {n_features}")
+        logging.info(f"Creating spatial graph with:")
+        logging.info(f"- Target nodes: {n_nodes} (n_lat: {n_lat} × n_lon: {n_lon})")
+        logging.info(f"- Features per variable: {expected_var_features}")
+        logging.info(f"- Total features: {n_features}")
         
         for var in sorted(data_dict.keys()):
             var_data = data_dict[var]
-            print(f"\nProcessing variable '{var}':")
-            print(f"- Original shape: {var_data.shape}")
+            logging.info(f"\nProcessing variable '{var}':")
+            logging.info(f"- Original shape: {var_data.shape}")
             
             try:
                 # Calculate precise indices for sampling
@@ -72,15 +74,15 @@ def create_spatial_nodes(
                 lat_indices = jnp.linspace(0, full_lat-1, n_lat, dtype=int)
                 lon_indices = jnp.linspace(0, full_lon-1, n_lon, dtype=int)
                 
-                print(f"- Sampling {n_lat} lat points and {n_lon} lon points")
+                logging.info(f"- Sampling {n_lat} lat points and {n_lon} lon points")
                 
                 # Index using the precise indices
                 downsampled = var_data[:, lat_indices][:, :, lon_indices]
-                print(f"- Downsampled shape: {downsampled.shape}")
+                logging.info(f"- Downsampled shape: {downsampled.shape}")
                 
                 # Reshape to (n_nodes, features_per_var)
                 var_features = downsampled.transpose(1, 2, 0).reshape(-1, expected_var_features)
-                print(f"- Reshaped to: {var_features.shape}")
+                logging.info(f"- Reshaped to: {var_features.shape}")
                 
                 if var_features.shape[0] != n_nodes:
                     raise ValueError(
@@ -90,13 +92,13 @@ def create_spatial_nodes(
                 
                 features.append(var_features)
             except Exception as e:
-                print(f"Error processing variable '{var}': {str(e)}")
+                logging.info(f"Error processing variable '{var}': {str(e)}")
                 raise
         
         try:
             nodes = jnp.concatenate(features, axis=1)
-            print(f"\nFinal nodes shape: {nodes.shape}")
-            print(f"Expected shape: ({n_nodes}, {n_features})")
+            logging.info(f"\nFinal nodes shape: {nodes.shape}")
+            logging.info(f"Expected shape: ({n_nodes}, {n_features})")
             
             if nodes.shape != (n_nodes, n_features):
                 raise ValueError(
@@ -104,7 +106,7 @@ def create_spatial_nodes(
                     f"got {nodes.shape}"
                 )
         except Exception as e:
-            print(f"Error concatenating features: {str(e)}")
+            logging.info(f"Error concatenating features: {str(e)}")
             raise
     else:
         nodes = jnp.zeros((n_nodes, n_features))

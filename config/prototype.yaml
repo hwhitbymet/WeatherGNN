@@ -4,7 +4,7 @@ model:
   n_pressure_levels: 13
   n_variables: 6
   n_sphere_points: 162
-  latent_size: 16
+  latent_size: 256
   num_layers: 1
   num_message_passing_steps: 1
   max_distance_degrees: 1.0
@@ -15,14 +15,17 @@ training:
 
 data:
   train_period:
+    name: 'train'
     start: "2019-01"
-    end: "2019-06"
+    end: "2019-03"
   validation_period: 
+    name: 'validation'
     start: "2020-01"
-    end: "2020-06"
+    end: "2020-03"
   test_period:
+    name: 'test'
     start: "2021-01"
-    end: "2021-06"
+    end: "2021-03"
   num_workers: 8
   zarr_dataset_path: "./ERA5_data/zarr/full_dataset.zarr"
   init_params_cache: "./cache/init_params.pkl"
