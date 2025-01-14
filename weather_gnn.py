@@ -13,8 +13,8 @@ from graph_utils import (
 )
 
 @dataclass
-class WeatherGNNConfig:
-    """Configuration for WeatherGNN and its components"""
+class ModelConfig:
+    """Configuration for the predictive model and its components"""
     # Spatial grid configuration
     # TODO: Get this programatically from the input data
     n_lat: int = 721
@@ -42,7 +42,7 @@ class WeatherGNNConfig:
 
 class WeatherPrediction(hk.Module):
     """Complete Encode-Process-Decode architecture for weather prediction"""
-    def __init__(self, config: WeatherGNNConfig):
+    def __init__(self, config: ModelConfig):
         super().__init__()
         self.config = config
         self.encoder = EncoderGNN(config)
@@ -88,7 +88,7 @@ class EncoderGNN(hk.Module):
     Encoder GNN that projects data from lat/lon grid to sphere grid through message passing.
     Uses a bipartite graph with directed edges from lat/lon to sphere nodes.
     """
-    def __init__(self, config: WeatherGNNConfig):
+    def __init__(self, config: ModelConfig):
         super().__init__()
         self.config = config
         
@@ -178,7 +178,7 @@ class ProcessorCNN(hk.Module):
     Processor that applies CNN operations on a connected spherical graph.
     Uses hexagonal connectivity where each node has exactly 6 neighbors.
     """
-    def __init__(self, config: WeatherGNNConfig):
+    def __init__(self, config: ModelConfig):
         super().__init__()
         self.config = config
         
@@ -239,7 +239,7 @@ class ProcessorCNN(hk.Module):
 
 class DecoderGNN(hk.Module):
     """Decoder GNN that projects sphere data back to lat/lon grid."""
-    def __init__(self, config: WeatherGNNConfig):
+    def __init__(self, config: ModelConfig):
         super().__init__()
         self.config = config
         
