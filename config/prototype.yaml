@@ -1,0 +1,29 @@
+model:
+  n_lat: 36         # 10 degree resolution
+  n_lon: 72
+  n_pressure_levels: 13
+  n_variables: 6
+  n_sphere_points: 162
+  latent_size: 16
+  num_layers: 1
+  num_message_passing_steps: 1
+  max_distance_degrees: 1.0
+
+training:
+  num_epochs: 2
+  early_stopping_patience: 2
+
+data:
+  train_period:
+    start: "2019-01"
+    end: "2019-06"
+  validation_period: 
+    start: "2020-01"
+    end: "2020-06"
+  test_period:
+    start: "2021-01"
+    end: "2021-06"
+  num_workers: 8
+  zarr_dataset_path: "./ERA5_data/zarr/full_dataset.zarr"
+  init_params_cache: "./cache/init_params.pkl"
+  splits_cache_dir: "./cache/splits_cache"

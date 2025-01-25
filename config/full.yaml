@@ -1,0 +1,26 @@
+# config/full.yaml
+
+model:
+  n_lat: 721
+  n_lon: 1440
+  n_pressure_levels: 13
+  n_variables: 6
+  n_sphere_points: 2883
+  latent_size: 256
+  num_layers: 2
+  num_message_passing_steps: 3
+  max_distance_degrees: 3.0
+
+training:
+  batch_size: 32
+  num_epochs: 100
+  early_stopping_patience: 10
+
+data:
+  start_year: 1979
+  end_year: 2020
+  validation_years: [1991, 2004, 2017]
+  testing_years: [2012, 2016, 2020]
+  num_workers: 8
+  zarr_dataset_path: "./ERA5_data/zarr/full_dataset.zarr"
+  init_params_cache: "./.cache/init_params.pkl"

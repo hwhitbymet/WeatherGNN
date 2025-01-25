@@ -1,26 +1,24 @@
-import os
-import json
-import jax.numpy as jnp
-import numpy as np
-import hashlib
-import zarr
-import pandas as pd
-import logging
-import pickle
+# io_utils.py
 
-from weather_gnn import ModelConfig
+from datetime import datetime
+import pandas as pd
+import numpy as np
+import zarr
+import logging
+import os
+import pickle
 
 def parse_period(period_str: str) -> pd.Timestamp:
     """Convert YYYY-MM string to pandas Timestamp"""
     return pd.Timestamp(period_str)
 
-def get_month_indices(period_start: str, period_end: str) -> list[int]:
+def get_month_indices(zarr_store, period_start: str, period_end: str) -> list[int]:
     """Get indices for months in the specified period"""
     start = parse_period(period_start)
     end = parse_period(period_end)
     
     # Create a date range for all months in the period
-    months = pd.date_range(start, end, freq='ME')
+    months = pd.date_range(start, end, freq='M')
     
     # Convert to indices (assuming data starts at 2019-01)
     data_start = pd.Timestamp('2019-01-01')
@@ -29,60 +27,43 @@ def get_month_indices(period_start: str, period_end: str) -> list[int]:
     
     return indices
 
-def get_zarr_splits(config: ModelConfig) -> dict:
+def get_zarr_splits(zarr_path: str, config: dict) -> dict:
     """
     Get training, validation and test splits based on monthly periods
     """
-    zarr_path = config.data.zarr_dataset_path
-    logging.info(f"Attempting to open Zarr dataset at: {zarr_path}")
-    
-    if not os.path.exists(zarr_path):
-        raise FileNotFoundError(f"Zarr dataset not found at {zarr_path}")
-        
-    try:
-        store = zarr.open(zarr_path, mode='r')
-        logging.info(f"Successfully opened Zarr store. Available variables: {list(store.keys())}")
-    except Exception as e:
-        logging.error(f"Failed to open Zarr dataset: {str(e)}")
-        raise
+    store = zarr.open(zarr_path, mode='r')
     
     # Get indices for each period
-    try:
-        train_indices = get_month_indices(
-            config.data.train_period["start"],
-            config.data.train_period["end"]
-        )
-        val_indices = get_month_indices(
-            config.data.validation_period["start"],
-            config.data.validation_period["end"]
-        )
-        test_indices = get_month_indices(
-            config.data.test_period["start"],
-            config.data.test_period["end"]
-        )
-    except Exception as e:
-        logging.error(f"Failed to calculate period indices: {str(e)}")
-        raise
-
+    train_indices = get_month_indices(
+        store, 
+        config['data']['train_period']['start'],
+        config['data']['train_period']['end']
+    )
+    val_indices = get_month_indices(
+        store,
+        config['data']['validation_period']['start'],
+        config['data']['validation_period']['end']
+    )
+    test_indices = get_month_indices(
+        store,
+        config['data']['test_period']['start'],
+        config['data']['test_period']['end']
+    )
+    
     # Create dictionary of arrays for each split
-    splits = {}
-    try:
-        splits = {
-            'train': {var: store[var][train_indices] for var in store},
-            'validation': {var: store[var][val_indices] for var in store},
-            'test': {var: store[var][test_indices] for var in store}
-        }
-    except Exception as e:
-        logging.error(f"Failed to create data splits: {str(e)}")
-        raise
-
+    splits = {
+        'train': {var: store[var][train_indices] for var in store},
+        'validation': {var: store[var][val_indices] for var in store},
+        'test': {var: store[var][test_indices] for var in store}
+    }
+    
     # Log data characteristics
     for split_name, split_data in splits.items():
         first_var = next(iter(split_data.values()))
         logging.info(f"{split_name} split characteristics:")
         logging.info(f"  Number of months: {len(first_var)}")
         for var, array in split_data.items():
-            logging.info(f"  {var}: shape {array.shape}, dtype: {array.dtype}")
+            logging.info(f"  {var}: shape {array.shape}")
     
     return splits
 

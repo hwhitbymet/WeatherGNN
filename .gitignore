@@ -2,4 +2,5 @@ ERA5_data
 __pycache__/
 ERA5_data/*
 *cache/
-.*venv/
+*venv/
+*logs/
