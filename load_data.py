@@ -1,172 +1,107 @@
-# load_data.py
 import os
 import zarr
 import xarray as xr
 import dask.array as da
-import dask
+import pandas as pd
+import pickle
+import logging
 from dask.distributed import LocalCluster
+from typing import Dict, List, Tuple
+from tqdm import tqdm
 
-def load_year_data(year, chunks=None):
-    """
-    Efficiently load a single year's data using Dask
+def get_period_indices(period: Dict[str, str]) -> List[int]:
+    """Get indices for a given period."""
+    start = pd.to_datetime(period["start"])
+    end = pd.to_datetime(period["end"])
+    date_range = pd.date_range(start, end, freq='ME')
+    base_date = pd.to_datetime('2019-01-01')
     
-    Args:
-    - year (int): Year to load
-    - chunks (dict): Chunking configuration
-    
-    Returns:
-    - dask.array or None: Loaded dataset or None if loading fails
-    """
-    try:
-        data_file_path = f"ERA5_data/netCDF/{year}/data.nc"
-        
-        # Use Dask to load the dataset lazily with intelligent chunking
-        ds = xr.open_dataset(
-            data_file_path, 
-            engine='h5netcdf', 
-            chunks=chunks or {'date': 'auto'}
-        )
-        
-        # Convert to Dask arrays explicitly
-        dask_vars = {
-            var: da.from_array(ds[var].values, chunks=ds[var].values.shape)
-            for var in ds.data_vars
-        }
-        
-        print(f"Prepared data for year {year}")
-        return dask_vars
-    
-    except Exception as e:
-        print(f"Error loading data for year {year}: {e}")
-        return None
+    return [(date.year - base_date.year) * 12 + date.month - base_date.month 
+            for date in date_range]
 
-def preprocess_and_save_zarr (years, num_workers, zarr_dataset_path):
-    """
-    Preprocess ERA5 data using Dask for parallel processing and save to Zarr
-    
-    Args:
-    - years (List[int]): Years to process
-    - full_dataset_path (str): Path to save Zarr dataset
-    - num_workers (int): Number of workers for parallel processing
-    """
-    # Set up Dask client to parallelise the  process
+# load_data.py
+def load_netcdf_to_zarr(start_year: int, end_year: int, zarr_path: str, num_workers: int) -> None:
+    logging.info(f"Starting netCDF to Zarr conversion for years {start_year}-{end_year}")
+    logging.info(f"Setting up Dask cluster with {num_workers} workers")
     cluster = LocalCluster(n_workers=num_workers, threads_per_worker=2)
+    
     try:
-        # Parallel loading of datasets using Dask delayed
-        dask_data_list = []
-        for year in years:
-            delayed_load = dask.delayed(load_year_data)(year)
-            dask_data_list.append(delayed_load)
+        all_monthly_data = []
+        total_years = end_year - start_year + 1
         
-        # Compute all delayed loads in parallel
-        loaded_data = dask.compute(*dask_data_list)
+        for year in tqdm(range(start_year, end_year + 1), desc="Processing years"):
+            data_path = f"ERA5_data/netCDF/{year}/data.nc"
+            logging.info(f"Loading netCDF data for year {year} ({year-start_year+1}/{total_years})")
+            ds = xr.open_dataset(data_path, engine='h5netcdf')
+            
+            logging.debug(f"Converting {year} data to monthly chunks")
+            monthly_data = {
+                var: da.from_array(ds[var].values, chunks=(1, *ds[var].values.shape[1:]))
+                for var in ds.data_vars
+            }
+            all_monthly_data.extend([monthly_data[var] for var in monthly_data])
+            logging.info(f"Year {year} processed: {len(ds.data_vars)} variables, {ds[next(iter(ds.data_vars))].shape[0]} timesteps")
         
-        # Filter out None values
-        loaded_data = [data for data in loaded_data if data is not None]
-        
-        # Ensure Zarr directory exists
-        os.makedirs(zarr_dataset_path, exist_ok=True)
-        store = zarr.DirectoryStore(zarr_dataset_path)
+        logging.info(f"Creating Zarr store at {zarr_path}")
+        os.makedirs(zarr_path, exist_ok=True)
+        store = zarr.DirectoryStore(zarr_path)
         root = zarr.group(store)
-
-        # Save each variable separately to avoid massive concat operations
-        # Get all variable names from the first loaded dataset
-        all_vars = list(loaded_data[0].keys())
         
-        for var_name in all_vars:
-            # Collect this variable's data from all years
-            var_data_list = [
-                data[var_name] for data in loaded_data
-            ]
+        for var_name in tqdm(ds.data_vars, desc="Saving variables to Zarr"):
+            logging.info(f"Processing variable: {var_name}")
+            var_data = da.concatenate([data[var_name] for data in all_monthly_data], axis=0)
+            logging.debug(f"Shape for {var_name}: {var_data.shape}")
             
-            # Concatenate along first axis (time/date)
-            var_dask_array = da.concatenate(var_data_list, axis=0)
-            
-            # Create and save Zarr array
             zarr_array = root.create_dataset(
-                var_name, 
-                shape=var_dask_array.shape, 
-                dtype=var_dask_array.dtype,
-                chunks=(12, *var_dask_array.shape[1:])
+                var_name,
+                shape=var_data.shape,
+                dtype=var_data.dtype,
+                chunks=(1, *var_data.shape[1:])
             )
+            logging.info(f"Saving {var_name} to Zarr...")
+            da.to_zarr(var_data, zarr_array)
             
-            # Compute and write the data
-            da.to_zarr(var_dask_array, zarr_array)
-        
-        print(f"Successfully saved dataset to {zarr_dataset_path}")
-    
+        logging.info("Zarr conversion completed successfully")
+            
     except Exception as e:
-        print(f"Error in preprocessing: {e}")
-    
+        logging.error(f"Error during Zarr conversion: {str(e)}", exc_info=True)
+        raise
     finally:
-        # Close Dask client and cluster
+        logging.info("Closing Dask cluster")
         cluster.close()
 
-
-def get_zarr_splits(
-    zarr_dataset_path,
-    validation_years,
-    testing_years,
-    training_start_year,
-    training_end_year,
-):
-    # Open Zarr store
-    store = zarr.DirectoryStore(zarr_dataset_path)
-    root = zarr.group(store)
-
-    # Check available variables
-    available_vars = list(root.array_keys())
-    print(f"Available variables in Zarr store: {available_vars}")
-
-    # Create list of all years between the requested start and end, inclusive
-    all_years = list(range(training_start_year, training_end_year + 1))
+def get_data_splits(config) -> dict:
+    cache_path = os.path.join(config.data.splits_cache_dir, 'data_splits.pickle')
     
-    def select_years(target_years):
-        """Select year indices"""
-        year_indices = [all_years.index(year) for year in target_years]
-        # Atmospheric data is monthly, so we do some arithmetic to get yearly slices
-        start_indices = [idx * 12 for idx in year_indices]
-        end_indices = [start + 12 for start in start_indices]
-        return start_indices, end_indices
-
-    # Prepare splits
+    # Try loading from cache first
+    if os.path.exists(cache_path):
+        logging.info(f"Loading data splits from cache: {cache_path}")
+        with open(cache_path, 'rb') as f:
+            return pickle.load(f)
+    
+    logging.info(f"Loading data splits from {config.data.zarr_dataset_path}")
+    store = zarr.open(config.data.zarr_dataset_path, mode='r')
+    
     splits = {}
+    for split_name in ['train', 'validation', 'test']:
+        period = getattr(config.data, f"{split_name}_period")
+        logging.info(f"Processing {split_name} split for period {period['start']} to {period['end']}")
+        
+        indices = get_period_indices(period)
+        logging.info(f"Generated {len(indices)} indices for {split_name} split")
+        
+        # Compute and store the actual data instead of just references
+        splits[split_name] = {
+            var: store[var][indices][:] for var in store.array_keys()
+        }
+        
+        first_var = next(iter(splits[split_name].values()))
+        logging.info(f"{split_name.capitalize()} split: {len(splits[split_name])} variables, shape {first_var.shape}")
     
-    # Validation split
-    val_starts, val_ends = select_years(validation_years)
-    val_data = {
-        var: da.from_zarr(root[var])[
-            da.concatenate([
-                da.arange(start, end) for start, end in zip(val_starts, val_ends)
-            ])
-        ] for var in available_vars
-    }
-    splits['validation'] = val_data
-
-    # Testing split
-    test_starts, test_ends = select_years(testing_years)
-    test_data = {
-        var: da.from_zarr(root[var])[
-            da.concatenate([
-                da.arange(start, end) for start, end in zip(test_starts, test_ends)
-            ])
-        ] for var in available_vars
-    }
-    splits['test'] = test_data
-
-    # Training split
-    training_years = [
-        year for year in all_years 
-        if year not in validation_years and year not in testing_years
-    ]
-    train_starts, train_ends = select_years(training_years)
-    train_data = {
-        var: da.from_zarr(root[var])[
-            da.concatenate([
-                da.arange(start, end) for start, end in zip(train_starts, train_ends)
-            ])
-        ] for var in available_vars
-    }
-    splits['train'] = train_data
-
+    # Save to cache
+    os.makedirs(config.data.splits_cache_dir, exist_ok=True)
+    logging.info(f"Saving data splits to cache: {cache_path}")
+    with open(cache_path, 'wb') as f:
+        pickle.dump(splits, f)
+    
     return splits
