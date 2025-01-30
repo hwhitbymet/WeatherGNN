@@ -34,180 +34,252 @@ class ModelConfig:
     def n_features(self) -> int:
         return self.n_variables * self.n_pressure_levels
 
-
-import jax
-import jax.numpy as jnp
-import jraph
-from functools import partial
-from typing import Tuple
-
-import jax
-import jax.numpy as jnp
-import jraph
-from functools import partial
-
-# @partial(jax.jit, static_argnums=(2, 3, 5, 6))
 def create_bipartite_graph(
     spatial_nodes: jnp.ndarray, 
     sphere_nodes: jnp.ndarray, 
     n_lat: int,
     n_lon: int,
-    rng_key: int,
+    rng_key: jax.random.PRNGKey,
     max_distance_deg: float = 3.0,
     target_feature_dim: int = 256,
     is_encoding: bool = True
 ) -> jraph.GraphsTuple:
-    """
-    Create a bipartite graph connecting spatial and sphere graph nodes based on spatial proximity.
+    """Vectorized bipartite graph creation with JAX optimizations."""
+    # Calculate coordinates using JAX operations
+    def calculate_lat_lon(n_lat, n_lon):
+        lat = jnp.linspace(-90.0, 90.0, n_lat)
+        lon = jnp.linspace(-180.0, 180.0, n_lon)
+        return jnp.stack(jnp.meshgrid(lat, lon, indexing='ij'), axis=-1).reshape(-1, 2)
+
+    # Vectorized Haversine formula
+    def vectorized_great_circle(sphere_coords, spatial_coords):
+        sphere_lat = jnp.deg2rad(sphere_coords[:, 0])
+        sphere_lon = jnp.deg2rad(sphere_coords[:, 1])
+        spatial_lat = jnp.deg2rad(spatial_coords[:, 0])
+        spatial_lon = jnp.deg2rad(spatial_coords[:, 1])
+
+        dlat = spatial_lat - sphere_lat[:, None]
+        dlon = spatial_lon - sphere_lon[:, None]
+        
+        a = (jnp.sin(dlat/2)**2 + 
+             jnp.cos(sphere_lat[:, None]) * jnp.cos(spatial_lat) * 
+             jnp.sin(dlon/2)**2)
+        return jnp.rad2deg(2 * jnp.arcsin(jnp.sqrt(a)))
+
+    # Project nodes using JAX operations
+    def mlp_project(nodes, target_dim, key):
+        input_dim = nodes.shape[-1]
+        weights = jax.random.normal(key, (input_dim, target_dim)) * jnp.sqrt(2/(input_dim+target_dim))
+        return nodes @ weights
     
-    Args:
-        spatial_nodes: Nodes representing spatial data
-        sphere_nodes: Nodes representing spherical data
-        n_lat: Number of latitude points
-        n_lon: Number of longitude points
-        max_distance_deg: Maximum distance in degrees for connecting nodes (default: 3 degrees)
-        target_feature_dim: Desired dimensionality for node and edge features via MLP projection
-        is_encoding: If True, draw edges from spatial to sphere nodes. 
-                     If False, draw edges from sphere to spatial nodes.
-    
-    Returns:
-        A bipartite jraph.GraphsTuple with directional edges and MLP-projected features
-    """
-    def find_nearby_nodes(sphere_pos, spatial_coords, max_distance):
-        """Find nearby spatial nodes within max distance"""
-        # Compute distances 
-        distances = great_circle_distance(
-            sphere_pos[0], sphere_pos[1], 
-            spatial_coords[:, 0], spatial_coords[:, 1]
-        )
-        
-        # Create a mask for nodes within max distance
-        nearby_mask = distances <= max_distance
-        
-        # Use jnp.nonzero with static shape to avoid tracing issues
-        nearby_indices = jnp.nonzero(nearby_mask, size=spatial_coords.shape[0])[0]
-        
-        return nearby_indices, distances[nearby_indices]
+    def cartesian_to_latlon(positions: jnp.ndarray) -> jnp.ndarray:
+        """Convert Cartesian coordinates to lat/lon degrees."""
+        r = jnp.linalg.norm(positions, axis=-1, keepdims=True)
+        lat = jnp.rad2deg(jnp.arcsin(positions[..., 2] / r.squeeze()))
+        lon = jnp.rad2deg(jnp.arctan2(positions[..., 1], positions[..., 0]))
+        return jnp.stack([lat, lon], axis=-1)
 
-    def mlp_project(nodes: jnp.ndarray, target_dim: int, rng_key) -> jnp.ndarray:
-        """
-        Project node features using a single linear layer (MLP)
-        
-        Args:
-            nodes: Input node features
-            target_dim: Target dimensionality
-        
-        Returns:
-            Projected node features
-        """
-        input_dim = nodes.shape[1]
-        
-        # Initialize weights using Glorot (Xavier) initialization
-        w = jax.random.normal(rng_key, (input_dim, target_dim)) * jnp.sqrt(2.0 / (input_dim + target_dim))
-        
-        # Linear projection
-        return jnp.dot(nodes, w)
-
-    def calculate_lat_lon(n_lat: int, n_lon: int) -> jnp.ndarray:
-        """
-        Calculate latitude and longitude for grid-based nodes
-        """
-        lat_coords = jnp.linspace(-90.0, 90.0, num=n_lat, dtype=jnp.float32)
-        lon_coords = jnp.linspace(-180.0, 180.0, num=n_lon, dtype=jnp.float32)
-        
-        lat_grid, lon_grid = jnp.meshgrid(lat_coords, lon_coords, indexing='ij')
-        return jnp.column_stack([lat_grid.ravel(), lon_grid.ravel()])
-
-    def great_circle_distance(lat1, lon1, lat2, lon2):
-        """
-        Calculate great circle distance between two points on a sphere
-        
-        Args:
-            lat1, lon1: Coordinates of first point
-            lat2, lon2: Coordinates of second point
-        
-        Returns:
-            Distance in degrees
-        """
-        # Convert to radians
-        lat1, lon1 = jnp.deg2rad(lat1), jnp.deg2rad(lon1)
-        lat2, lon2 = jnp.deg2rad(lat2), jnp.deg2rad(lon2)
-        
-        # Haversine formula
-        dlat = lat2 - lat1
-        dlon = lon2 - lon1
-        
-        a = jnp.sin(dlat/2)**2 + jnp.cos(lat1) * jnp.cos(lat2) * jnp.sin(dlon/2)**2
-        c = 2 * jnp.arcsin(jnp.sqrt(a))
-        
-        return jnp.rad2deg(c)
-
-    def cartesian_to_latlon(positions):
-        r = jnp.linalg.norm(positions, axis=1)
-        lat = jnp.arcsin(positions[:, 2] / r)
-        lon = jnp.arctan2(positions[:, 1], positions[:, 0])
-        return jnp.column_stack([
-            jnp.rad2deg(lat), 
-            jnp.rad2deg(lon)
-        ])
-
-    logging.info(f"Projecting spatial node features to {target_feature_dim} dimensions")
-    # Project node features to target dimensionality
-    spatial_nodes_projected = mlp_project(spatial_nodes, target_feature_dim, rng_key)
-    logging.info(f"Projecting edge features to {target_feature_dim} dimensions")
-    # sphere_nodes_projected = mlp_project(sphere_nodes, target_feature_dim, rng_key)
-
-    logging.info(f"Calculating co-ordinates of all nodes...")
-    # Calculate spatial and sphere node coordinates
+    # --- Main execution ---
+    # 1. Calculate coordinates
     spatial_coords = calculate_lat_lon(n_lat, n_lon)
-    sphere_coords = cartesian_to_latlon(
-        calculate_sphere_node_positions(sphere_nodes.shape[0])
-    )
-    
-    logging.info(f"Creating edge connections...")
-    # Compute pairwise distances and create edge connections
-    senders, receivers, edge_features = [], [], []
+    sphere_positions = calculate_sphere_node_positions(sphere_nodes.shape[0])
+    sphere_coords = cartesian_to_latlon(sphere_positions)
 
-    for i, (sphere_pos, sphere_node) in enumerate(zip(sphere_coords, sphere_nodes)):
-        logging.info(f"Finding neighbours for node {i}")
-        # Find nearby spatial nodes
-        nearby_indices, _ = find_nearby_nodes(
-            sphere_pos, spatial_coords, max_distance_deg
-        )
-        
-        for spatial_idx in nearby_indices:
-            # Calculate displacement vector
-            spatial_pos = spatial_coords[spatial_idx]
-            displacement = jnp.array([
-                sphere_pos[0] - spatial_pos[0],  # lat diff
-                sphere_pos[1] - spatial_pos[1],  # lon diff
-                jnp.linalg.norm(sphere_node - spatial_nodes_projected[spatial_idx])
-            ])
-            
-            # Adjust senders and receivers based on is_encoding
-            if is_encoding:
-                senders.append(spatial_idx)
-                receivers.append(i)
-            else:
-                senders.append(i)
-                receivers.append(spatial_idx)
-            
-            edge_features.append(displacement)
-
-    # Convert to jax arrays
-    senders = jnp.array(senders)
-    receivers = jnp.array(receivers)
-    edge_features = jnp.array(edge_features)
+    # 2. Vectorized distance calculation
+    dist_matrix = vectorized_great_circle(sphere_coords, spatial_coords)  # [M, N]
     
+    # 3. Find valid connections with static size
+    mask = dist_matrix <= max_distance_deg
+    sphere_idx, spatial_idx = jnp.where(mask, size=sphere_coords.shape[0]*6)  # Approx max neighbors
+
+    # 4. Create edge features
+    displacements = jnp.stack([
+        sphere_coords[sphere_idx, 0] - spatial_coords[spatial_idx, 0],
+        sphere_coords[sphere_idx, 1] - spatial_coords[spatial_idx, 1],
+        jnp.linalg.norm(sphere_nodes[sphere_idx] - spatial_nodes[spatial_idx], axis=-1)
+    ], axis=1)
+
+    # 5. Project spatial features
+    spatial_projected = mlp_project(spatial_nodes, target_feature_dim, rng_key)
+
+    # 6. Determine directionality
+    if is_encoding:
+        senders, receivers = spatial_idx, sphere_idx
+    else:
+        senders, receivers = sphere_idx, spatial_idx
+
     return jraph.GraphsTuple(
-        nodes=jnp.concatenate([spatial_nodes_projected, sphere_nodes], axis=0),
-        edges=edge_features,
+        nodes=jnp.concatenate([spatial_projected, sphere_nodes], axis=0),
+        edges=displacements,
         senders=senders,
         receivers=receivers,
-        n_node=jnp.array([spatial_nodes_projected.shape[0], sphere_nodes.shape[0]]),
-        n_edge=jnp.array([len(senders)]),
+        n_node=jnp.array([spatial_projected.shape[0], sphere_nodes.shape[0]]),
+        n_edge=jnp.array([senders.size]),
         globals=None
     )
+
+# @partial(jax.jit, static_argnums=(2, 3, 5, 6))
+# def create_bipartite_graph(
+#     spatial_nodes: jnp.ndarray, 
+#     sphere_nodes: jnp.ndarray, 
+#     n_lat: int,
+#     n_lon: int,
+#     rng_key: int,
+#     max_distance_deg: float = 3.0,
+#     target_feature_dim: int = 256,
+#     is_encoding: bool = True
+# ) -> jraph.GraphsTuple:
+#     """
+#     Create a bipartite graph connecting spatial and sphere graph nodes based on spatial proximity.
+    
+#     Args:
+#         spatial_nodes: Nodes representing spatial data
+#         sphere_nodes: Nodes representing spherical data
+#         n_lat: Number of latitude points
+#         n_lon: Number of longitude points
+#         max_distance_deg: Maximum distance in degrees for connecting nodes (default: 3 degrees)
+#         target_feature_dim: Desired dimensionality for node and edge features via MLP projection
+#         is_encoding: If True, draw edges from spatial to sphere nodes. 
+#                      If False, draw edges from sphere to spatial nodes.
+    
+#     Returns:
+#         A bipartite jraph.GraphsTuple with directional edges and MLP-projected features
+#     """
+#     def find_nearby_nodes(sphere_pos, spatial_coords, max_distance):
+#         """Find nearby spatial nodes within max distance"""
+#         # Compute distances 
+#         distances = great_circle_distance(
+#             sphere_pos[0], sphere_pos[1], 
+#             spatial_coords[:, 0], spatial_coords[:, 1]
+#         )
+        
+#         # Create a mask for nodes within max distance
+#         nearby_mask = distances <= max_distance
+        
+#         # Use jnp.nonzero with static shape to avoid tracing issues
+#         nearby_indices = jnp.nonzero(nearby_mask, size=spatial_coords.shape[0])[0]
+        
+#         return nearby_indices, distances[nearby_indices]
+
+#     def mlp_project(nodes: jnp.ndarray, target_dim: int, rng_key) -> jnp.ndarray:
+#         """
+#         Project node features using a single linear layer (MLP)
+        
+#         Args:
+#             nodes: Input node features
+#             target_dim: Target dimensionality
+        
+#         Returns:
+#             Projected node features
+#         """
+#         input_dim = nodes.shape[1]
+        
+#         # Initialize weights using Glorot (Xavier) initialization
+#         w = jax.random.normal(rng_key, (input_dim, target_dim)) * jnp.sqrt(2.0 / (input_dim + target_dim))
+        
+#         # Linear projection
+#         return jnp.dot(nodes, w)
+
+#     def calculate_lat_lon(n_lat: int, n_lon: int) -> jnp.ndarray:
+#         """
+#         Calculate latitude and longitude for grid-based nodes
+#         """
+#         lat_coords = jnp.linspace(-90.0, 90.0, num=n_lat, dtype=jnp.float32)
+#         lon_coords = jnp.linspace(-180.0, 180.0, num=n_lon, dtype=jnp.float32)
+        
+#         lat_grid, lon_grid = jnp.meshgrid(lat_coords, lon_coords, indexing='ij')
+#         return jnp.column_stack([lat_grid.ravel(), lon_grid.ravel()])
+
+#     def great_circle_distance(lat1, lon1, lat2, lon2):
+#         """
+#         Calculate great circle distance between two points on a sphere
+        
+#         Args:
+#             lat1, lon1: Coordinates of first point
+#             lat2, lon2: Coordinates of second point
+        
+#         Returns:
+#             Distance in degrees
+#         """
+#         # Convert to radians
+#         lat1, lon1 = jnp.deg2rad(lat1), jnp.deg2rad(lon1)
+#         lat2, lon2 = jnp.deg2rad(lat2), jnp.deg2rad(lon2)
+        
+#         # Haversine formula
+#         dlat = lat2 - lat1
+#         dlon = lon2 - lon1
+        
+#         a = jnp.sin(dlat/2)**2 + jnp.cos(lat1) * jnp.cos(lat2) * jnp.sin(dlon/2)**2
+#         c = 2 * jnp.arcsin(jnp.sqrt(a))
+        
+#         return jnp.rad2deg(c)
+
+#     def cartesian_to_latlon(positions):
+#         r = jnp.linalg.norm(positions, axis=1)
+#         lat = jnp.arcsin(positions[:, 2] / r)
+#         lon = jnp.arctan2(positions[:, 1], positions[:, 0])
+#         return jnp.column_stack([
+#             jnp.rad2deg(lat), 
+#             jnp.rad2deg(lon)
+#         ])
+
+#     logging.info(f"Projecting spatial node features to {target_feature_dim} dimensions")
+#     # Project node features to target dimensionality
+#     spatial_nodes_projected = mlp_project(spatial_nodes, target_feature_dim, rng_key)
+#     logging.info(f"Projecting edge features to {target_feature_dim} dimensions")
+#     # sphere_nodes_projected = mlp_project(sphere_nodes, target_feature_dim, rng_key)
+
+#     logging.info(f"Calculating co-ordinates of all nodes...")
+#     # Calculate spatial and sphere node coordinates
+#     spatial_coords = calculate_lat_lon(n_lat, n_lon)
+#     sphere_coords = cartesian_to_latlon(
+#         calculate_sphere_node_positions(sphere_nodes.shape[0])
+#     )
+    
+#     logging.info(f"Creating edge connections...")
+#     # Compute pairwise distances and create edge connections
+#     senders, receivers, edge_features = [], [], []
+
+#     for i, (sphere_pos, sphere_node) in enumerate(zip(sphere_coords, sphere_nodes)):
+#         logging.info(f"Finding neighbours for node {i}")
+#         # Find nearby spatial nodes
+#         nearby_indices, _ = find_nearby_nodes(
+#             sphere_pos, spatial_coords, max_distance_deg
+#         )
+        
+#         for spatial_idx in nearby_indices:
+#             # Calculate displacement vector
+#             spatial_pos = spatial_coords[spatial_idx]
+#             displacement = jnp.array([
+#                 sphere_pos[0] - spatial_pos[0],  # lat diff
+#                 sphere_pos[1] - spatial_pos[1],  # lon diff
+#                 jnp.linalg.norm(sphere_node - spatial_nodes_projected[spatial_idx])
+#             ])
+            
+#             # Adjust senders and receivers based on is_encoding
+#             if is_encoding:
+#                 senders.append(spatial_idx)
+#                 receivers.append(i)
+#             else:
+#                 senders.append(i)
+#                 receivers.append(spatial_idx)
+            
+#             edge_features.append(displacement)
+
+#     # Convert to jax arrays
+#     senders = jnp.array(senders)
+#     receivers = jnp.array(receivers)
+#     edge_features = jnp.array(edge_features)
+    
+#     return jraph.GraphsTuple(
+#         nodes=jnp.concatenate([spatial_nodes_projected, sphere_nodes], axis=0),
+#         edges=edge_features,
+#         senders=senders,
+#         receivers=receivers,
+#         n_node=jnp.array([spatial_nodes_projected.shape[0], sphere_nodes.shape[0]]),
+#         n_edge=jnp.array([len(senders)]),
+#         globals=None
+#     )
 
 def make_mlp(input_size: int, hidden_size: int, output_size: int) -> hk.Sequential:
     """Creates a simple MLP with one hidden layer"""
