@@ -313,26 +313,70 @@ class MessagePassingWeights(hk.Module):
 def message_passing_step(
     weights: MessagePassingWeights,
     graph: jraph.GraphsTuple,
-    num_segments: int  # <--- Add this argument
+    is_encoding: bool  # New flag to distinguish encoder/decoder
 ) -> jraph.GraphsTuple:
-    """Message passing with explicit num_segments for aggregation."""
+    """
+    Message passing that updates ONLY RECEIVER NODES.
+    
+    Args:
+        is_encoding: True for spatial → sphere, False for sphere → spatial.
+    """
+    # Extract sender and receiver features
     senders = graph.nodes[graph.senders]
     receivers = graph.nodes[graph.receivers]
-    edge_inputs = jnp.concatenate([graph.edges, senders, receivers], axis=1)
     
+    # Edge update: MLP(edge_features || sender_features || receiver_features)
+    edge_inputs = jnp.concatenate([graph.edges, senders, receivers], axis=1)
     updated_edges = weights.edge_mlp(edge_inputs)
     
-    # Use num_segments to aggregate correctly
+    # Node update: Only aggregate messages for RECEIVERS
+    # --------------------------------------------------
+    # Determine which nodes are receivers (sphere or spatial)
+    if is_encoding:
+        # Encoding: receivers are sphere nodes (second partition)
+        receiver_mask = graph.receivers >= graph.n_node[0]  # Spatial nodes come first
+        num_segments = graph.n_node[1]  # Sphere node count
+    else:
+        # Decoding: receivers are spatial nodes (first partition)
+        receiver_mask = graph.receivers < graph.n_node[0]   # Spatial nodes
+        num_segments = graph.n_node[0]  # Spatial node count
+    
+    # Aggregate messages ONLY for valid receivers
+    valid_receivers = graph.receivers[receiver_mask]
+    valid_messages = updated_edges[receiver_mask]
+    
     messages = jraph.segment_sum(
-        updated_edges,
-        graph.receivers,
-        num_segments=num_segments  # <--- Critical fix
+        valid_messages,
+        valid_receivers,
+        num_segments=num_segments
     )
     
-    node_inputs = jnp.concatenate([graph.nodes, messages], axis=1)
-    updated_nodes = weights.node_mlp(node_inputs)
+    # Update ONLY receiver nodes
+    # --------------------------
+    if is_encoding:
+        # Update sphere nodes (second partition)
+        receiver_nodes = graph.nodes[graph.n_node[0]:]  # Sphere nodes
+        updated_receivers = weights.node_mlp(
+            jnp.concatenate([receiver_nodes, messages], axis=1)
+        )
+        # Replace only sphere nodes
+        all_nodes = jnp.concatenate([
+            graph.nodes[:graph.n_node[0]],  # Keep spatial nodes unchanged
+            updated_receivers
+        ], axis=0)
+    else:
+        # Update spatial nodes (first partition)
+        receiver_nodes = graph.nodes[:graph.n_node[0]]  # Spatial nodes
+        updated_receivers = weights.node_mlp(
+            jnp.concatenate([receiver_nodes, messages], axis=1)
+        )
+        # Replace only spatial nodes
+        all_nodes = jnp.concatenate([
+            updated_receivers,
+            graph.nodes[graph.n_node[0]:]  # Keep sphere nodes unchanged
+        ], axis=0)
     
-    return graph._replace(nodes=updated_nodes, edges=updated_edges)
+    return graph._replace(nodes=all_nodes, edges=updated_edges)
 
 class ProcessorCNN(hk.Module):
     """ProcessorCNN implementing spherical convolutions without stateful caching"""
@@ -492,7 +536,7 @@ class EncoderGNN(hk.Module):
             encoder_graph = message_passing_step(
                 message_weights,
                 encoder_graph,
-                num_segments=self.config.n_sphere_points  # <--- Sphere nodes are receivers
+                is_encoding=True
             )
         
         # Extract and return updated sphere nodes
@@ -538,7 +582,7 @@ class DecoderGNN(hk.Module):
             decoder_graph = message_passing_step(
                 message_weights,
                 decoder_graph,
-                num_segments=self.config.n_spatial_nodes  # <--- Spatial nodes are receivers
+                is_encoding=False
             )
         
         # Project spatial nodes back to original feature space
