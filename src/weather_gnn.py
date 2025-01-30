@@ -432,16 +432,6 @@ class WeatherPrediction(hk.Module):
         self.decoder = DecoderGNN(config)
         self.rng_key = rng_key
         
-        # Initialize message passing weights
-        self.encoder_mp_weights = MessagePassingWeights(
-            config.latent_size, 
-            name='encoder_mp'
-        )
-        self.decoder_mp_weights = MessagePassingWeights(
-            config.latent_size, 
-            name='decoder_mp'
-        )
-    
     def __call__(self, latlon_data: dict[str, jnp.ndarray]) -> jnp.ndarray:
         # Create initial spatial graph
         spatial_graph = create_spatial_nodes(
@@ -463,20 +453,19 @@ class WeatherPrediction(hk.Module):
             spatial_nodes, 
             sphere_graph, 
             self.rng_key, 
-            message_weights=self.encoder_mp_weights
         )
         processed = self.processor(encoded.nodes)
         return self.decoder(
+            spatial_nodes,
             processed, 
             self.rng_key, 
-            message_weights=self.decoder_mp_weights
         )
 
 class EncoderGNN(hk.Module):
     def __init__(self, config: ModelConfig):
         super().__init__()
         self.config = config
-        # Define MLPs within the encoder
+        # Define MLPs 
         self.edge_mlp = hk.Sequential([
             hk.Linear(config.latent_size),
             jax.nn.relu,
@@ -529,7 +518,7 @@ class DecoderGNN(hk.Module):
     def __init__(self, config: ModelConfig):
         super().__init__()
         self.config = config
-        # Define MLPs within the encoder
+        # Define MLPs 
         self.edge_mlp = hk.Sequential([
             hk.Linear(config.latent_size),
             jax.nn.relu,
