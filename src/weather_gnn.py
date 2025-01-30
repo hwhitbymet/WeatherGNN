@@ -313,69 +313,47 @@ class MessagePassingWeights(hk.Module):
 def message_passing_step(
     weights: MessagePassingWeights,
     graph: jraph.GraphsTuple,
-    is_encoding: bool  # New flag to distinguish encoder/decoder
+    is_encoding: bool
 ) -> jraph.GraphsTuple:
-    """
-    Message passing that updates ONLY RECEIVER NODES.
-    
-    Args:
-        is_encoding: True for spatial → sphere, False for sphere → spatial.
-    """
-    # Extract sender and receiver features
+    """JIT-safe message passing using known bipartite structure."""
+    # Extract partitions
+    n_spatial = graph.n_node[0]
+    n_sphere = graph.n_node[1]
+    total_nodes = n_spatial + n_sphere
+
+    # Edge update
     senders = graph.nodes[graph.senders]
     receivers = graph.nodes[graph.receivers]
-    
-    # Edge update: MLP(edge_features || sender_features || receiver_features)
     edge_inputs = jnp.concatenate([graph.edges, senders, receivers], axis=1)
     updated_edges = weights.edge_mlp(edge_inputs)
-    
-    # Node update: Only aggregate messages for RECEIVERS
-    # --------------------------------------------------
-    # Determine which nodes are receivers (sphere or spatial)
+
+    # Bipartite-aware message aggregation
     if is_encoding:
-        # Encoding: receivers are sphere nodes (second partition)
-        receiver_mask = graph.receivers >= graph.n_node[0]  # Spatial nodes come first
-        num_segments = graph.n_node[1]  # Sphere node count
-    else:
-        # Decoding: receivers are spatial nodes (first partition)
-        receiver_mask = graph.receivers < graph.n_node[0]   # Spatial nodes
-        num_segments = graph.n_node[0]  # Spatial node count
-    
-    # Aggregate messages ONLY for valid receivers
-    valid_receivers = graph.receivers[receiver_mask]
-    valid_messages = updated_edges[receiver_mask]
-    
-    messages = jraph.segment_sum(
-        valid_messages,
-        valid_receivers,
-        num_segments=num_segments
-    )
-    
-    # Update ONLY receiver nodes
-    # --------------------------
-    if is_encoding:
-        # Update sphere nodes (second partition)
-        receiver_nodes = graph.nodes[graph.n_node[0]:]  # Sphere nodes
-        updated_receivers = weights.node_mlp(
-            jnp.concatenate([receiver_nodes, messages], axis=1)
+        # Encoding: spatial → sphere
+        # Receivers are sphere nodes (indices n_spatial <= i < total_nodes)
+        receiver_ids = graph.receivers - n_spatial  # Convert to 0-based for sphere nodes
+        messages = jax.ops.segment_sum(
+            updated_edges,
+            receiver_ids,
+            num_segments=n_sphere
         )
-        # Replace only sphere nodes
-        all_nodes = jnp.concatenate([
-            graph.nodes[:graph.n_node[0]],  # Keep spatial nodes unchanged
-            updated_receivers
-        ], axis=0)
+        # Update sphere nodes only
+        sphere_nodes = graph.nodes[n_spatial:]
+        updated_sphere = weights.node_mlp(jnp.concatenate([sphere_nodes, messages], axis=1))
+        all_nodes = jnp.concatenate([graph.nodes[:n_spatial], updated_sphere], axis=0)
     else:
-        # Update spatial nodes (first partition)
-        receiver_nodes = graph.nodes[:graph.n_node[0]]  # Spatial nodes
-        updated_receivers = weights.node_mlp(
-            jnp.concatenate([receiver_nodes, messages], axis=1)
+        # Decoding: sphere → spatial
+        # Receivers are spatial nodes (indices 0 <= i < n_spatial)
+        messages = jax.ops.segment_sum(
+            updated_edges,
+            graph.receivers,
+            num_segments=n_spatial
         )
-        # Replace only spatial nodes
-        all_nodes = jnp.concatenate([
-            updated_receivers,
-            graph.nodes[graph.n_node[0]:]  # Keep sphere nodes unchanged
-        ], axis=0)
-    
+        # Update spatial nodes only
+        spatial_nodes = graph.nodes[:n_spatial]
+        updated_spatial = weights.node_mlp(jnp.concatenate([spatial_nodes, messages], axis=1))
+        all_nodes = jnp.concatenate([updated_spatial, graph.nodes[n_spatial:]], axis=0)
+
     return graph._replace(nodes=all_nodes, edges=updated_edges)
 
 class ProcessorCNN(hk.Module):
@@ -421,7 +399,7 @@ class ProcessorCNN(hk.Module):
         
         return current_features
     
-    @partial(jax.jit, static_argnums=(0,))
+    # @partial(jax.jit, static_argnums=(0,))
     def _find_sphere_neighbours(self) -> jnp.ndarray:
         """Calculate 6 nearest neighbors for each sphere point using a JIT-compiled function"""
         # Calculate sphere point positions
@@ -513,13 +491,13 @@ class EncoderGNN(hk.Module):
         logging.info("Creating bipartite graph...")
         
         # JIT-compile the function itself
-        create_bipartite_graph_jit = jax.jit(
-            create_bipartite_graph, 
-            static_argnums=(2, 3, 6)
-        )
+        # create_bipartite_graph_jit = jax.jit(
+        #     create_bipartite_graph, 
+        #     static_argnums=(2, 3, 6)
+        # )
         
         # Create encoder graph
-        encoder_graph = create_bipartite_graph_jit(
+        encoder_graph = create_bipartite_graph(
             spatial_nodes,
             sphere_graph.nodes,
             self.config.n_lat,
@@ -561,12 +539,12 @@ class DecoderGNN(hk.Module):
         )
 
         # Create decoder graph
-        create_bipartite_graph_jit = jax.jit(
-            create_bipartite_graph, 
-            static_argnums=(2, 3)
-        )
+        # create_bipartite_graph_jit = jax.jit(
+        #     create_bipartite_graph, 
+        #     static_argnums=(2, 3)
+        # )
         
-        decoder_graph = create_bipartite_graph_jit(
+        decoder_graph = create_bipartite_graph(
             spatial_nodes,
             sphere_nodes,
             self.config.n_lat,
