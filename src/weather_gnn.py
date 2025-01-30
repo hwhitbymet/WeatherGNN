@@ -35,13 +35,11 @@ class ModelConfig:
         return self.n_variables * self.n_pressure_levels
 
 def create_bipartite_graph(
-    spatial_nodes: jnp.ndarray, 
+    spatial_nodes: jnp.ndarray,
     sphere_nodes: jnp.ndarray, 
     n_lat: int,
     n_lon: int,
-    rng_key: jax.random.PRNGKey,
     max_distance_deg: float = 3.0,
-    target_feature_dim: int = 256,
     is_encoding: bool = True
 ) -> jraph.GraphsTuple:
     """Vectorized bipartite graph creation with JAX optimizations."""
@@ -66,12 +64,6 @@ def create_bipartite_graph(
              jnp.sin(dlon/2)**2)
         return jnp.rad2deg(2 * jnp.arcsin(jnp.sqrt(a)))
 
-    # Project nodes using JAX operations
-    def mlp_project(nodes, target_dim, key):
-        input_dim = nodes.shape[-1]
-        weights = jax.random.normal(key, (input_dim, target_dim)) * jnp.sqrt(2/(input_dim+target_dim))
-        return nodes @ weights
-    
     def cartesian_to_latlon(positions: jnp.ndarray) -> jnp.ndarray:
         """Convert Cartesian coordinates to lat/lon degrees."""
         r = jnp.linalg.norm(positions, axis=-1, keepdims=True)
@@ -92,28 +84,25 @@ def create_bipartite_graph(
     mask = dist_matrix <= max_distance_deg
     sphere_idx, spatial_idx = jnp.where(mask, size=sphere_coords.shape[0]*6)  # Approx max neighbors
 
-    # 5. Project spatial features
-    spatial_projected = mlp_project(spatial_nodes, target_feature_dim, rng_key)
-
     # 4. Create edge features
     displacements = jnp.stack([
         sphere_coords[sphere_idx, 0] - spatial_coords[spatial_idx, 0],
         sphere_coords[sphere_idx, 1] - spatial_coords[spatial_idx, 1],
-        jnp.linalg.norm(sphere_nodes[sphere_idx] - spatial_projected[spatial_idx], axis=-1)
+        jnp.linalg.norm(sphere_nodes[sphere_idx] - spatial_nodes[spatial_idx], axis=-1)
     ], axis=1)
 
-    # 6. Determine directionality
+    # 5. Determine directionality
     if is_encoding:
         senders, receivers = spatial_idx, sphere_idx
     else:
         senders, receivers = sphere_idx, spatial_idx
 
     return jraph.GraphsTuple(
-        nodes=jnp.concatenate([spatial_projected, sphere_nodes], axis=0),
+        nodes=jnp.concatenate([spatial_nodes, sphere_nodes], axis=0),
         edges=displacements,
         senders=senders,
         receivers=receivers,
-        n_node=jnp.array([spatial_projected.shape[0], sphere_nodes.shape[0]]),
+        n_node=jnp.array([spatial_nodes.shape[0], sphere_nodes.shape[0]]),
         n_edge=jnp.array([senders.size]),
         globals=None
     )
@@ -465,6 +454,8 @@ class EncoderGNN(hk.Module):
     def __init__(self, config: ModelConfig):
         super().__init__()
         self.config = config
+        # Define projection layer for spatial nodes
+        self.spatial_projection = hk.Linear(256)  # Target feature dim is 256
         # Define MLPs 
         self.edge_mlp = hk.Sequential([
             hk.Linear(config.latent_size),
@@ -480,19 +471,19 @@ class EncoderGNN(hk.Module):
         ])
 
     def __call__(self, spatial_nodes, sphere_graph, rng_key):
-        # Create encoder graph
+        # Project spatial nodes using Haiku Linear layer
+        spatial_nodes_projected = self.spatial_projection(spatial_nodes)
+        
+        # Create encoder graph (modify create_bipartite_graph to use projected nodes)
         encoder_graph = create_bipartite_graph(
-            spatial_nodes,
+            spatial_nodes_projected,  # Use projected nodes
             sphere_graph.nodes,
             self.config.n_lat,
             self.config.n_lon,
-            rng_key,
-            target_feature_dim=256,
             is_encoding=True
         )
         
         for _ in range(self.config.num_message_passing_steps):
-            # Apply message passing using internal MLPs
             encoder_graph = self._message_passing_step(encoder_graph)
         
         return sphere_graph._replace(nodes=encoder_graph.nodes[self.config.n_spatial_nodes:])
@@ -518,6 +509,8 @@ class DecoderGNN(hk.Module):
     def __init__(self, config: ModelConfig):
         super().__init__()
         self.config = config
+        # Define projection layer for spatial nodes
+        self.spatial_projection = hk.Linear(self.config.latent_size)
         # Define MLPs 
         self.edge_mlp = hk.Sequential([
             hk.Linear(config.latent_size),
@@ -533,22 +526,22 @@ class DecoderGNN(hk.Module):
         ])
 
     def __call__(self, spatial_nodes, sphere_graph, rng_key):
+        # Project spatial nodes using Haiku Linear layer
+        spatial_nodes_projected = self.spatial_projection(spatial_nodes)
+        
         # Create encoder graph
-        decoder_graph = create_bipartite_graph(
-            spatial_nodes,
+        encoder_graph = create_bipartite_graph(
+            spatial_nodes_projected,
             sphere_graph.nodes,
             self.config.n_lat,
             self.config.n_lon,
-            rng_key,
-            target_feature_dim=256,
-            is_encoding=False
+            is_encoding=True
         )
         
         for _ in range(self.config.num_message_passing_steps):
-            # Apply message passing using internal MLPs
-            decoder_graph = self._message_passing_step(decoder_graph)
+            encoder_graph = self._message_passing_step(encoder_graph)
         
-        return sphere_graph._replace(nodes=decoder_graph.nodes[self.config.n_spatial_nodes:])
+        return sphere_graph._replace(nodes=encoder_graph.nodes[self.config.n_spatial_nodes:])
 
     def _message_passing_step(self, graph: jraph.GraphsTuple):
         # Edge update
