@@ -310,15 +310,17 @@ class MessagePassingWeights(hk.Module):
             hk.Linear(latent_size)
         ])
 
+from functools import partial
+
+@partial(jax.jit, static_argnames=('is_encoding', 'n_spatial', 'n_sphere'))
 def message_passing_step(
     weights: MessagePassingWeights,
     graph: jraph.GraphsTuple,
-    is_encoding: bool
+    is_encoding: bool,
+    n_spatial: int,  # Passed as static from model config
+    n_sphere: int    # Passed as static from model config
 ) -> jraph.GraphsTuple:
-    """JIT-safe message passing using known bipartite structure."""
-    # Extract partitions
-    n_spatial = graph.n_node[0]
-    n_sphere = graph.n_node[1]
+    """JIT-safe message passing using static bipartite structure."""
     total_nodes = n_spatial + n_sphere
 
     # Edge update
@@ -329,27 +331,21 @@ def message_passing_step(
 
     # Bipartite-aware message aggregation
     if is_encoding:
-        # Encoding: spatial → sphere
-        # Receivers are sphere nodes (indices n_spatial <= i < total_nodes)
-        receiver_ids = graph.receivers - n_spatial  # Convert to 0-based for sphere nodes
+        receiver_ids = graph.receivers - n_spatial  # 0-based sphere indices
         messages = jax.ops.segment_sum(
             updated_edges,
             receiver_ids,
-            num_segments=n_sphere
+            num_segments=n_sphere  # Static value from config
         )
-        # Update sphere nodes only
         sphere_nodes = graph.nodes[n_spatial:]
         updated_sphere = weights.node_mlp(jnp.concatenate([sphere_nodes, messages], axis=1))
         all_nodes = jnp.concatenate([graph.nodes[:n_spatial], updated_sphere], axis=0)
     else:
-        # Decoding: sphere → spatial
-        # Receivers are spatial nodes (indices 0 <= i < n_spatial)
         messages = jax.ops.segment_sum(
             updated_edges,
             graph.receivers,
-            num_segments=n_spatial
+            num_segments=n_spatial  # Static value from config
         )
-        # Update spatial nodes only
         spatial_nodes = graph.nodes[:n_spatial]
         updated_spatial = weights.node_mlp(jnp.concatenate([spatial_nodes, messages], axis=1))
         all_nodes = jnp.concatenate([updated_spatial, graph.nodes[n_spatial:]], axis=0)
@@ -510,13 +506,14 @@ class EncoderGNN(hk.Module):
         
         # Apply message passing steps using provided weights
         for _ in range(self.config.num_message_passing_steps):
-            # Use sphere node count as num_segments
             encoder_graph = message_passing_step(
                 message_weights,
                 encoder_graph,
-                is_encoding=True
+                is_encoding=True,
+                n_spatial=self.config.n_spatial_nodes,  # From ModelConfig
+                n_sphere=self.config.n_sphere_points    # From ModelConfig
             )
-        
+                
         # Extract and return updated sphere nodes
         return sphere_graph._replace(
             nodes=encoder_graph.nodes[self.config.n_spatial_nodes:]
@@ -556,13 +553,14 @@ class DecoderGNN(hk.Module):
         
         # Apply message passing with provided weights
         for _ in range(self.config.num_message_passing_steps):
-            # Use spatial node count as num_segments
             decoder_graph = message_passing_step(
                 message_weights,
                 decoder_graph,
-                is_encoding=False
+                is_encoding=False,
+                n_spatial=self.config.n_spatial_nodes,  # From ModelConfig
+                n_sphere=self.config.n_sphere_points    # From ModelConfig
             )
-        
+                
         # Project spatial nodes back to original feature space
         spatial_nodes = decoder_graph.nodes[:self.config.n_spatial_nodes]
         return make_mlp(
