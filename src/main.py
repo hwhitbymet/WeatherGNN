@@ -13,11 +13,11 @@ from load_data import load_netcdf_to_zarr, get_data_splits
 from config import Configuration
 from weather_gnn import WeatherPrediction
 
-def create_forward_fn(config, rng_key):
+def create_forward_fn(config):
     """Create the forward pass function with Haiku transform"""
     def forward_fn(latlon_data: dict[str, jnp.ndarray]) -> jnp.ndarray:
-        model = WeatherPrediction(config, rng_key)
-        return model(latlon_data)
+        model = WeatherPrediction(config, latlon_data)
+        return model()
     
     return hk.without_apply_rng(hk.transform(forward_fn))
 
@@ -240,9 +240,9 @@ def main(config_path: str, dataset_path:str):
     logging.info("Data splits loaded successfully")
     
     # Initialize model
-    rng = jax.random.PRNGKey(42)
+    # rng = jax.random.PRNGKey(42)
     logging.info("Creating model forward function...")
-    model = create_forward_fn(config.model, rng)
+    model = create_forward_fn(config.model)
 
     # Initialize parameters
     logging.info("Initializing model parameters...")
@@ -250,7 +250,7 @@ def main(config_path: str, dataset_path:str):
         init_data = {var: splits['train'][var][0][:] 
                      for var in splits['train'].keys()}
         # params = model.init(rng, init_data, config.model)
-        params = model.init(rng, init_data)
+        params = model.init(config, init_data)
         with open(config.data.init_params_cache, 'wb') as f:
             pickle.dump(params, f)
         logging.info(f"Saved initial parameters to {config.data.init_params_cache}")

@@ -107,239 +107,6 @@ def create_bipartite_graph(
         globals=None
     )
 
-# @partial(jax.jit, static_argnums=(2, 3, 5, 6))
-# def create_bipartite_graph(
-#     spatial_nodes: jnp.ndarray, 
-#     sphere_nodes: jnp.ndarray, 
-#     n_lat: int,
-#     n_lon: int,
-#     rng_key: int,
-#     max_distance_deg: float = 3.0,
-#     target_feature_dim: int = 256,
-#     is_encoding: bool = True
-# ) -> jraph.GraphsTuple:
-#     """
-#     Create a bipartite graph connecting spatial and sphere graph nodes based on spatial proximity.
-    
-#     Args:
-#         spatial_nodes: Nodes representing spatial data
-#         sphere_nodes: Nodes representing spherical data
-#         n_lat: Number of latitude points
-#         n_lon: Number of longitude points
-#         max_distance_deg: Maximum distance in degrees for connecting nodes (default: 3 degrees)
-#         target_feature_dim: Desired dimensionality for node and edge features via MLP projection
-#         is_encoding: If True, draw edges from spatial to sphere nodes. 
-#                      If False, draw edges from sphere to spatial nodes.
-    
-#     Returns:
-#         A bipartite jraph.GraphsTuple with directional edges and MLP-projected features
-#     """
-#     def find_nearby_nodes(sphere_pos, spatial_coords, max_distance):
-#         """Find nearby spatial nodes within max distance"""
-#         # Compute distances 
-#         distances = great_circle_distance(
-#             sphere_pos[0], sphere_pos[1], 
-#             spatial_coords[:, 0], spatial_coords[:, 1]
-#         )
-        
-#         # Create a mask for nodes within max distance
-#         nearby_mask = distances <= max_distance
-        
-#         # Use jnp.nonzero with static shape to avoid tracing issues
-#         nearby_indices = jnp.nonzero(nearby_mask, size=spatial_coords.shape[0])[0]
-        
-#         return nearby_indices, distances[nearby_indices]
-
-#     def mlp_project(nodes: jnp.ndarray, target_dim: int, rng_key) -> jnp.ndarray:
-#         """
-#         Project node features using a single linear layer (MLP)
-        
-#         Args:
-#             nodes: Input node features
-#             target_dim: Target dimensionality
-        
-#         Returns:
-#             Projected node features
-#         """
-#         input_dim = nodes.shape[1]
-        
-#         # Initialize weights using Glorot (Xavier) initialization
-#         w = jax.random.normal(rng_key, (input_dim, target_dim)) * jnp.sqrt(2.0 / (input_dim + target_dim))
-        
-#         # Linear projection
-#         return jnp.dot(nodes, w)
-
-#     def calculate_lat_lon(n_lat: int, n_lon: int) -> jnp.ndarray:
-#         """
-#         Calculate latitude and longitude for grid-based nodes
-#         """
-#         lat_coords = jnp.linspace(-90.0, 90.0, num=n_lat, dtype=jnp.float32)
-#         lon_coords = jnp.linspace(-180.0, 180.0, num=n_lon, dtype=jnp.float32)
-        
-#         lat_grid, lon_grid = jnp.meshgrid(lat_coords, lon_coords, indexing='ij')
-#         return jnp.column_stack([lat_grid.ravel(), lon_grid.ravel()])
-
-#     def great_circle_distance(lat1, lon1, lat2, lon2):
-#         """
-#         Calculate great circle distance between two points on a sphere
-        
-#         Args:
-#             lat1, lon1: Coordinates of first point
-#             lat2, lon2: Coordinates of second point
-        
-#         Returns:
-#             Distance in degrees
-#         """
-#         # Convert to radians
-#         lat1, lon1 = jnp.deg2rad(lat1), jnp.deg2rad(lon1)
-#         lat2, lon2 = jnp.deg2rad(lat2), jnp.deg2rad(lon2)
-        
-#         # Haversine formula
-#         dlat = lat2 - lat1
-#         dlon = lon2 - lon1
-        
-#         a = jnp.sin(dlat/2)**2 + jnp.cos(lat1) * jnp.cos(lat2) * jnp.sin(dlon/2)**2
-#         c = 2 * jnp.arcsin(jnp.sqrt(a))
-        
-#         return jnp.rad2deg(c)
-
-#     def cartesian_to_latlon(positions):
-#         r = jnp.linalg.norm(positions, axis=1)
-#         lat = jnp.arcsin(positions[:, 2] / r)
-#         lon = jnp.arctan2(positions[:, 1], positions[:, 0])
-#         return jnp.column_stack([
-#             jnp.rad2deg(lat), 
-#             jnp.rad2deg(lon)
-#         ])
-
-#     logging.info(f"Projecting spatial node features to {target_feature_dim} dimensions")
-#     # Project node features to target dimensionality
-#     spatial_nodes_projected = mlp_project(spatial_nodes, target_feature_dim, rng_key)
-#     logging.info(f"Projecting edge features to {target_feature_dim} dimensions")
-#     # sphere_nodes_projected = mlp_project(sphere_nodes, target_feature_dim, rng_key)
-
-#     logging.info(f"Calculating co-ordinates of all nodes...")
-#     # Calculate spatial and sphere node coordinates
-#     spatial_coords = calculate_lat_lon(n_lat, n_lon)
-#     sphere_coords = cartesian_to_latlon(
-#         calculate_sphere_node_positions(sphere_nodes.shape[0])
-#     )
-    
-#     logging.info(f"Creating edge connections...")
-#     # Compute pairwise distances and create edge connections
-#     senders, receivers, edge_features = [], [], []
-
-#     for i, (sphere_pos, sphere_node) in enumerate(zip(sphere_coords, sphere_nodes)):
-#         logging.info(f"Finding neighbours for node {i}")
-#         # Find nearby spatial nodes
-#         nearby_indices, _ = find_nearby_nodes(
-#             sphere_pos, spatial_coords, max_distance_deg
-#         )
-        
-#         for spatial_idx in nearby_indices:
-#             # Calculate displacement vector
-#             spatial_pos = spatial_coords[spatial_idx]
-#             displacement = jnp.array([
-#                 sphere_pos[0] - spatial_pos[0],  # lat diff
-#                 sphere_pos[1] - spatial_pos[1],  # lon diff
-#                 jnp.linalg.norm(sphere_node - spatial_nodes_projected[spatial_idx])
-#             ])
-            
-#             # Adjust senders and receivers based on is_encoding
-#             if is_encoding:
-#                 senders.append(spatial_idx)
-#                 receivers.append(i)
-#             else:
-#                 senders.append(i)
-#                 receivers.append(spatial_idx)
-            
-#             edge_features.append(displacement)
-
-#     # Convert to jax arrays
-#     senders = jnp.array(senders)
-#     receivers = jnp.array(receivers)
-#     edge_features = jnp.array(edge_features)
-    
-#     return jraph.GraphsTuple(
-#         nodes=jnp.concatenate([spatial_nodes_projected, sphere_nodes], axis=0),
-#         edges=edge_features,
-#         senders=senders,
-#         receivers=receivers,
-#         n_node=jnp.array([spatial_nodes_projected.shape[0], sphere_nodes.shape[0]]),
-#         n_edge=jnp.array([len(senders)]),
-#         globals=None
-#     )
-
-def make_mlp(input_size: int, hidden_size: int, output_size: int) -> hk.Sequential:
-    """Creates a simple MLP with one hidden layer"""
-    return hk.Sequential([
-        hk.Linear(hidden_size), jax.nn.relu,
-        hk.LayerNorm(axis=-1, create_scale=True, create_offset=True),
-        hk.Linear(output_size)
-    ])
-
-class MessagePassingWeights(hk.Module):
-    """Module to hold and reuse weights for message passing"""
-    def __init__(self, latent_size: int, name: str = None):
-        super().__init__(name=name)
-        self.latent_size = latent_size
-        
-        # Create MLPs once during initialization
-        self.edge_mlp = hk.Sequential([
-            hk.Linear(latent_size), 
-            jax.nn.relu,
-            hk.LayerNorm(axis=-1, create_scale=True, create_offset=True),
-            hk.Linear(latent_size)
-        ])
-        
-        self.node_mlp = hk.Sequential([
-            hk.Linear(latent_size), 
-            jax.nn.relu,
-            hk.LayerNorm(axis=-1, create_scale=True, create_offset=True),
-            hk.Linear(latent_size)
-        ])
-
-from functools import partial
-
-@partial(jax.jit, static_argnames=('is_encoding', 'n_spatial', 'n_sphere'))
-def message_passing_step(
-    weights: MessagePassingWeights,
-    graph: jraph.GraphsTuple,
-    is_encoding: bool,
-    n_spatial: int,  # Passed as static from model config
-    n_sphere: int    # Passed as static from model config
-) -> jraph.GraphsTuple:
-    """JIT-safe message passing using static bipartite structure."""
-    total_nodes = n_spatial + n_sphere
-
-    # Edge update
-    senders = graph.nodes[graph.senders]
-    receivers = graph.nodes[graph.receivers]
-    edge_inputs = jnp.concatenate([graph.edges, senders, receivers], axis=1)
-    updated_edges = weights.edge_mlp(edge_inputs)
-
-    # Bipartite-aware message aggregation
-    if is_encoding:
-        receiver_ids = graph.receivers - n_spatial  # 0-based sphere indices
-        messages = jax.ops.segment_sum(
-            updated_edges,
-            receiver_ids,
-            num_segments=n_sphere  # Static value from config
-        )
-        sphere_nodes = graph.nodes[n_spatial:]
-        updated_sphere = weights.node_mlp(jnp.concatenate([sphere_nodes, messages], axis=1))
-        all_nodes = jnp.concatenate([graph.nodes[:n_spatial], updated_sphere], axis=0)
-    else:
-        messages = jax.ops.segment_sum(
-            updated_edges,
-            graph.receivers,
-            num_segments=n_spatial  # Static value from config
-        )
-        spatial_nodes = graph.nodes[:n_spatial]
-        updated_spatial = weights.node_mlp(jnp.concatenate([spatial_nodes, messages], axis=1))
-        all_nodes = jnp.concatenate([updated_spatial, graph.nodes[n_spatial:]], axis=0)
-
-    return graph._replace(nodes=all_nodes, edges=updated_edges)
 
 class ProcessorCNN(hk.Module):
     """ProcessorCNN implementing spherical convolutions without stateful caching"""
@@ -412,16 +179,13 @@ class ProcessorCNN(hk.Module):
         return jax.lax.dynamic_slice_in_dim(neighbor_indices, 1, 6, axis=1)
 
 class WeatherPrediction(hk.Module):
-    """Updated WeatherPrediction to use optimized components"""
-    def __init__(self, config: ModelConfig, rng_key):
+    def __init__(self, config: ModelConfig, latlon_data: dict[str, jnp.ndarray]):
         super().__init__()
         self.config = config
         self.encoder = EncoderGNN(config)
         self.processor = ProcessorCNN(config)
         self.decoder = DecoderGNN(config)
-        self.rng_key = rng_key
-        
-    def __call__(self, latlon_data: dict[str, jnp.ndarray]) -> jnp.ndarray:
+
         # Create initial spatial graph
         spatial_graph = create_spatial_nodes(
             latlon_data, 
@@ -429,25 +193,29 @@ class WeatherPrediction(hk.Module):
             self.config.n_lon, 
             self.config.n_features
         )
-        spatial_nodes = spatial_graph.nodes
+
+        # Project spatial node features to the same size as those in the spherical graph (the latent space)
+        # This avoid dimension mismatch during concatenation operations during message passing
+        spatial_projection = hk.Linear(self.config.latent_size)
+        self.spatial_nodes = spatial_projection(spatial_graph.nodes)
         
         # Create empty sphere graph
-        sphere_graph = create_sphere_nodes(
+        self.sphere_graph = create_sphere_nodes(
             n_points=self.config.n_sphere_points, 
             latent_dim=self.config.latent_size
         )
         
+    def __call__(self) -> jnp.ndarray:
+        
         # Apply each component with proper weight reuse
         encoded = self.encoder(
-            spatial_nodes, 
-            sphere_graph, 
-            self.rng_key, 
+            self.spatial_nodes, 
+            self.sphere_graph, 
         )
         processed = self.processor(encoded.nodes)
         return self.decoder(
-            spatial_nodes,
+            self.spatial_nodes,
             processed, 
-            self.rng_key, 
         )
 
 class EncoderGNN(hk.Module):
@@ -455,7 +223,7 @@ class EncoderGNN(hk.Module):
         super().__init__()
         self.config = config
         # Define projection layer for spatial nodes
-        self.spatial_projection = hk.Linear(256)  # Target feature dim is 256
+        # self.spatial_projection = hk.Linear(256)  # Target feature dim is 256
         # Define MLPs 
         self.edge_mlp = hk.Sequential([
             hk.Linear(config.latent_size),
@@ -470,13 +238,11 @@ class EncoderGNN(hk.Module):
             hk.Linear(config.latent_size)
         ])
 
-    def __call__(self, spatial_nodes, sphere_graph, rng_key):
-        # Project spatial nodes using Haiku Linear layer
-        spatial_nodes_projected = self.spatial_projection(spatial_nodes)
+    def __call__(self, spatial_nodes, sphere_graph):
         
         # Create encoder graph (modify create_bipartite_graph to use projected nodes)
         encoder_graph = create_bipartite_graph(
-            spatial_nodes_projected,  # Use projected nodes
+            spatial_nodes,  # Use projected nodes
             sphere_graph.nodes,
             self.config.n_lat,
             self.config.n_lon,
@@ -510,7 +276,7 @@ class DecoderGNN(hk.Module):
         super().__init__()
         self.config = config
         # Define projection layer for spatial nodes
-        self.spatial_projection = hk.Linear(self.config.latent_size)
+        # self.spatial_projection = hk.Linear(self.config.latent_size)
         # Define MLPs 
         self.edge_mlp = hk.Sequential([
             hk.Linear(config.latent_size),
@@ -525,7 +291,7 @@ class DecoderGNN(hk.Module):
             hk.Linear(config.latent_size)
         ])
 
-    def __call__(self, spatial_nodes, sphere_graph, rng_key):
+    def __call__(self, spatial_nodes, sphere_graph):
         # Project spatial nodes using Haiku Linear layer
         spatial_nodes_projected = self.spatial_projection(spatial_nodes)
         
