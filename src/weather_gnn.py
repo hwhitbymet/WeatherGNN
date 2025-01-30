@@ -310,26 +310,29 @@ class MessagePassingWeights(hk.Module):
             hk.Linear(latent_size)
         ])
 
-def message_passing_step(weights: MessagePassingWeights, graph: jraph.GraphsTuple) -> jraph.GraphsTuple:
-    """Optimized message passing using pre-initialized weights"""
+def message_passing_step(
+    weights: MessagePassingWeights,
+    graph: jraph.GraphsTuple,
+    num_segments: int  # <--- Add this argument
+) -> jraph.GraphsTuple:
+    """Message passing with explicit num_segments for aggregation."""
     senders = graph.nodes[graph.senders]
     receivers = graph.nodes[graph.receivers]
     edge_inputs = jnp.concatenate([graph.edges, senders, receivers], axis=1)
     
-    # Use stored weights
     updated_edges = weights.edge_mlp(edge_inputs)
     
+    # Use num_segments to aggregate correctly
     messages = jraph.segment_sum(
         updated_edges,
         graph.receivers,
-        graph.n_node[0]
+        num_segments=num_segments  # <--- Critical fix
     )
     
     node_inputs = jnp.concatenate([graph.nodes, messages], axis=1)
     updated_nodes = weights.node_mlp(node_inputs)
     
     return graph._replace(nodes=updated_nodes, edges=updated_edges)
-
 
 class ProcessorCNN(hk.Module):
     """ProcessorCNN implementing spherical convolutions without stateful caching"""
@@ -485,7 +488,12 @@ class EncoderGNN(hk.Module):
         
         # Apply message passing steps using provided weights
         for _ in range(self.config.num_message_passing_steps):
-            encoder_graph = message_passing_step(message_weights, encoder_graph)
+            # Use sphere node count as num_segments
+            encoder_graph = message_passing_step(
+                message_weights,
+                encoder_graph,
+                num_segments=self.config.n_sphere_points  # <--- Sphere nodes are receivers
+            )
         
         # Extract and return updated sphere nodes
         return sphere_graph._replace(
@@ -526,7 +534,12 @@ class DecoderGNN(hk.Module):
         
         # Apply message passing with provided weights
         for _ in range(self.config.num_message_passing_steps):
-            decoder_graph = message_passing_step(message_weights, decoder_graph)
+            # Use spatial node count as num_segments
+            decoder_graph = message_passing_step(
+                message_weights,
+                decoder_graph,
+                num_segments=self.config.n_spatial_nodes  # <--- Spatial nodes are receivers
+            )
         
         # Project spatial nodes back to original feature space
         spatial_nodes = decoder_graph.nodes[:self.config.n_spatial_nodes]
