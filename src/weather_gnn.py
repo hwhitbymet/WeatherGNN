@@ -476,22 +476,21 @@ class EncoderGNN(hk.Module):
     def __init__(self, config: ModelConfig):
         super().__init__()
         self.config = config
-    
-    def __call__(
-        self, 
-        spatial_nodes: jnp.ndarray, 
-        sphere_graph: jraph.GraphsTuple, 
-        rng_key,
-        message_weights: MessagePassingWeights
-    ) -> jraph.GraphsTuple:
-        logging.info("Creating bipartite graph...")
-        
-        # JIT-compile the function itself
-        # create_bipartite_graph_jit = jax.jit(
-        #     create_bipartite_graph, 
-        #     static_argnums=(2, 3, 6)
-        # )
-        
+        # Define MLPs within the encoder
+        self.edge_mlp = hk.Sequential([
+            hk.Linear(config.latent_size),
+            jax.nn.relu,
+            hk.LayerNorm(axis=-1, create_scale=True, create_offset=True),
+            hk.Linear(config.latent_size)
+        ])
+        self.node_mlp = hk.Sequential([
+            hk.Linear(config.latent_size),
+            jax.nn.relu,
+            hk.LayerNorm(axis=-1, create_scale=True, create_offset=True),
+            hk.Linear(config.latent_size)
+        ])
+
+    def __call__(self, spatial_nodes, sphere_graph, rng_key):
         # Create encoder graph
         encoder_graph = create_bipartite_graph(
             spatial_nodes,
@@ -499,72 +498,82 @@ class EncoderGNN(hk.Module):
             self.config.n_lat,
             self.config.n_lon,
             rng_key,
-            target_feature_dim=256
+            target_feature_dim=256,
+            is_encoding=True
         )
         
-        logging.info("Bipartite graph created. Applying message passing...")
-        
-        # Apply message passing steps using provided weights
         for _ in range(self.config.num_message_passing_steps):
-            encoder_graph = message_passing_step(
-                message_weights,
-                encoder_graph,
-                is_encoding=True,
-                n_spatial=self.config.n_spatial_nodes,  # From ModelConfig
-                n_sphere=self.config.n_sphere_points    # From ModelConfig
-            )
-                
-        # Extract and return updated sphere nodes
-        return sphere_graph._replace(
-            nodes=encoder_graph.nodes[self.config.n_spatial_nodes:]
-        )
+            # Apply message passing using internal MLPs
+            encoder_graph = self._message_passing_step(encoder_graph)
+        
+        return sphere_graph._replace(nodes=encoder_graph.nodes[self.config.n_spatial_nodes:])
+
+    def _message_passing_step(self, graph: jraph.GraphsTuple):
+        # Edge update
+        senders = graph.nodes[graph.senders]
+        receivers = graph.nodes[graph.receivers]
+        edge_inputs = jnp.concatenate([graph.edges, senders, receivers], axis=1)
+        updated_edges = self.edge_mlp(edge_inputs)
+        
+        # Node update
+        receiver_ids = graph.receivers - self.config.n_spatial_nodes
+        messages = jax.ops.segment_sum(updated_edges, receiver_ids, self.config.n_sphere_points)
+        sphere_nodes = graph.nodes[self.config.n_spatial_nodes:]
+        node_inputs = jnp.concatenate([sphere_nodes, messages], axis=1)
+        updated_sphere = self.node_mlp(node_inputs)
+        nodes = jnp.concatenate([graph.nodes[:self.config.n_spatial_nodes], updated_sphere], axis=0)
+        
+        return graph._replace(nodes=nodes, edges=updated_edges)
 
 class DecoderGNN(hk.Module):
     def __init__(self, config: ModelConfig):
         super().__init__()
         self.config = config
-    
-    def __call__(
-        self, 
-        sphere_nodes: jnp.ndarray, 
-        rng_key,
-        message_weights: MessagePassingWeights
-    ) -> jnp.ndarray:
-        # Initialize empty spatial nodes
-        spatial_nodes = jnp.zeros(
-            (self.config.n_spatial_nodes, self.config.latent_size)
-        )
+        # Define MLPs within the encoder
+        self.edge_mlp = hk.Sequential([
+            hk.Linear(config.latent_size),
+            jax.nn.relu,
+            hk.LayerNorm(axis=-1, create_scale=True, create_offset=True),
+            hk.Linear(config.latent_size)
+        ])
+        self.node_mlp = hk.Sequential([
+            hk.Linear(config.latent_size),
+            jax.nn.relu,
+            hk.LayerNorm(axis=-1, create_scale=True, create_offset=True),
+            hk.Linear(config.latent_size)
+        ])
 
-        # Create decoder graph
-        # create_bipartite_graph_jit = jax.jit(
-        #     create_bipartite_graph, 
-        #     static_argnums=(2, 3)
-        # )
-        
+    def __call__(self, spatial_nodes, sphere_graph, rng_key):
+        # Create encoder graph
         decoder_graph = create_bipartite_graph(
             spatial_nodes,
-            sphere_nodes,
+            sphere_graph.nodes,
             self.config.n_lat,
             self.config.n_lon,
             rng_key,
-            is_encoding=False,
-            target_feature_dim=256
+            target_feature_dim=256,
+            is_encoding=False
         )
         
-        # Apply message passing with provided weights
         for _ in range(self.config.num_message_passing_steps):
-            decoder_graph = message_passing_step(
-                message_weights,
-                decoder_graph,
-                is_encoding=False,
-                n_spatial=self.config.n_spatial_nodes,  # From ModelConfig
-                n_sphere=self.config.n_sphere_points    # From ModelConfig
-            )
-                
-        # Project spatial nodes back to original feature space
-        spatial_nodes = decoder_graph.nodes[:self.config.n_spatial_nodes]
-        return make_mlp(
-            self.config.latent_size,
-            self.config.latent_size,
-            self.config.n_features
-        )(spatial_nodes)
+            # Apply message passing using internal MLPs
+            decoder_graph = self._message_passing_step(decoder_graph)
+        
+        return sphere_graph._replace(nodes=decoder_graph.nodes[self.config.n_spatial_nodes:])
+
+    def _message_passing_step(self, graph: jraph.GraphsTuple):
+        # Edge update
+        senders = graph.nodes[graph.senders]
+        receivers = graph.nodes[graph.receivers]
+        edge_inputs = jnp.concatenate([graph.edges, senders, receivers], axis=1)
+        updated_edges = self.edge_mlp(edge_inputs)
+        
+        # Node update
+        receiver_ids = graph.receivers - self.config.n_spatial_nodes
+        messages = jax.ops.segment_sum(updated_edges, receiver_ids, self.config.n_sphere_points)
+        sphere_nodes = graph.nodes[self.config.n_spatial_nodes:]
+        node_inputs = jnp.concatenate([sphere_nodes, messages], axis=1)
+        updated_sphere = self.node_mlp(node_inputs)
+        nodes = jnp.concatenate([graph.nodes[:self.config.n_spatial_nodes], updated_sphere], axis=0)
+        
+        return graph._replace(nodes=nodes, edges=updated_edges)
