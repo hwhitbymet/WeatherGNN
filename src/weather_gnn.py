@@ -92,15 +92,15 @@ def create_bipartite_graph(
     mask = dist_matrix <= max_distance_deg
     sphere_idx, spatial_idx = jnp.where(mask, size=sphere_coords.shape[0]*6)  # Approx max neighbors
 
+    # 5. Project spatial features
+    spatial_projected = mlp_project(spatial_nodes, target_feature_dim, rng_key)
+
     # 4. Create edge features
     displacements = jnp.stack([
         sphere_coords[sphere_idx, 0] - spatial_coords[spatial_idx, 0],
         sphere_coords[sphere_idx, 1] - spatial_coords[spatial_idx, 1],
-        jnp.linalg.norm(sphere_nodes[sphere_idx] - spatial_nodes[spatial_idx], axis=-1)
+        jnp.linalg.norm(sphere_nodes[sphere_idx] - spatial_projected[spatial_idx], axis=-1)
     ], axis=1)
-
-    # 5. Project spatial features
-    spatial_projected = mlp_project(spatial_nodes, target_feature_dim, rng_key)
 
     # 6. Determine directionality
     if is_encoding:
