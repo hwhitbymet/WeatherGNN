@@ -16,49 +16,23 @@ from weather_gnn import WeatherPrediction
 def create_forward_fn(config):
     """Create the forward pass function with Haiku transform"""
     def forward_fn(latlon_data: dict[str, jnp.ndarray]) -> jnp.ndarray:
-        model = WeatherPrediction(config, latlon_data)
-        return model()
+        model = WeatherPrediction(config)
+        return model(latlon_data)
     
     return hk.without_apply_rng(hk.transform(forward_fn))
 
 def create_train_step(forward_fn, optimizer):
-    """
-    Create a single training step function
-    
-    Args:
-        forward_fn: Haiku transformed forward function
-        optimizer: Optax optimizer
-    
-    Returns:
-        Jitted training step function
-    """
-    def train_step(params, rng, input_data, target_data):
-        """
-        Single training step
-        
-        Args:
-            params: Model parameters
-            rng: Random number generator
-            input_data: Input data for current timestep
-            target_data: Ground truth for next timestep
-        
-        Returns:
-            Tuple of (updated params, loss)
-        """
+    """Create a single training step function with state handling"""
+    def train_step(params, opt_state, rng, input_data, target_data):
         def loss_fn(params):
-            # Note: forward_fn.apply no longer needs state
             pred = forward_fn.apply(params, input_data)
             return compute_loss(pred, target_data)
         
-        # Compute gradients
-        grad_fn = jax.value_and_grad(loss_fn)
-        loss, grads = grad_fn(params)
-        
-        # Update parameters
-        updates, _ = optimizer.update(grads, None)
+        # Compute gradients and update
+        loss, grads = jax.value_and_grad(loss_fn)(params)
+        updates, new_opt_state = optimizer.update(grads, opt_state, params)
         updated_params = optax.apply_updates(params, updates)
-        
-        return updated_params, loss
+        return updated_params, new_opt_state, loss
     
     return jax.jit(train_step)
 
@@ -82,10 +56,9 @@ def train(
     """
     # Setup optimizer
     optimizer = optax.adam(learning_rate=1e-3)
+    opt_state = optimizer.init(params)
+
     train_step = create_train_step(model, optimizer)
-    
-    # Random number generator
-    rng = jax.random.PRNGKey(42)
     
     # Extract data splits
     train_data = splits['train']
@@ -123,16 +96,18 @@ def train(
             leave=False
         )
         
+            # In the training loop (inside the 'train' function):
         for t in train_timestep_progress:
             # Prepare input (current timestep) and target (next timestep)
             input_data = {var: train_data[var][t] for var in train_data}
-            target_data = {var: train_data[var][t+1] for var in train_data}
-            
-            # Separate random key for this step
-            step_rng = jax.random.fold_in(rng, t)
+            # Concatenate target variables along the feature dimension
+            # For each timestep:
+            target_vars = [train_data[var][t+1] for var in train_data]  # List of (n_lat, n_lon, n_pressure)
+            target_data = jnp.concatenate(target_vars, axis=0)
+            step_rng = jax.random.PRNGKey(42)
             
             # Perform training step
-            params, loss = train_step(params, step_rng, input_data, target_data)
+            params, opt_state, loss = train_step(params, opt_state, step_rng, input_data, target_data)
             train_loss += loss
             
             # Update training timestep progress bar
@@ -150,12 +125,11 @@ def train(
         )
         
         for t in val_timestep_progress:
-            # Prepare input (current timestep) and target (next timestep)
             input_data = {var: val_data[var][t] for var in val_data}
-            target_data = {var: val_data[var][t+1] for var in val_data}
+            # For each timestep:
+            target_vars = [train_data[var][t+1] for var in train_data]  # List of (n_lat, n_lon, n_pressure)
+            target_data = jnp.concatenate(target_vars, axis=-1)  # Shape: (n_lat, n_lon, n_vars*n_pressure)
             
-            # Compute validation loss (without gradient updates)
-            # Note: apply no longer needs state
             pred = model.apply(params, input_data)
             loss = compute_loss(pred, target_data)
             val_loss += loss
@@ -205,6 +179,8 @@ def compute_loss(pred: jnp.ndarray, target: jnp.ndarray) -> jnp.ndarray:
     Returns:
         Scalar loss value
     """
+    pred = pred.reshape(721, 1440, 78)
+    pred = jnp.transpose(pred, (2, 0, 1))
     return jnp.mean(jnp.square(pred - target))
 
 def main(config_path: str, dataset_path:str):
@@ -247,10 +223,11 @@ def main(config_path: str, dataset_path:str):
     # Initialize parameters
     logging.info("Initializing model parameters...")
     if not os.path.exists(config.data.init_params_cache):
-        init_data = {var: splits['train'][var][0][:] 
-                     for var in splits['train'].keys()}
-        # params = model.init(rng, init_data, config.model)
-        params = model.init(config, init_data)
+        init_data = {var: splits['train'][var][0] for var in splits['train'].keys()}
+        rng = jax.random.PRNGKey(42)
+        params = model.init(rng, init_data)
+        # init_data_sample = {var: jnp.ones((1, 721, 1440)) for var in splits['train'].keys()}  # Mock data
+        # params = model.init(jax.random.PRNGKey(42), init_data_sample)
         with open(config.data.init_params_cache, 'wb') as f:
             pickle.dump(params, f)
         logging.info(f"Saved initial parameters to {config.data.init_params_cache}")

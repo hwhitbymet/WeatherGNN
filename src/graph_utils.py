@@ -102,9 +102,10 @@ def create_spatial_nodes(
             
             if nodes.shape != (n_nodes, n_features):
                 raise ValueError(
-                    f"Final shape mismatch. Expected ({n_nodes}, {n_features}), "
-                    f"got {nodes.shape}"
+                    f"Feature dimension mismatch. Expected {n_features}, got {nodes.shape[1]}. "
+                    "Check variable downsampling and concatenation."
                 )
+
         except Exception as e:
             logging.info(f"Error concatenating features: {str(e)}")
             raise
