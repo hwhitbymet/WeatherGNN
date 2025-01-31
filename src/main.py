@@ -13,6 +13,8 @@ from load_data import load_netcdf_to_zarr, get_data_splits
 from config import Configuration
 from weather_gnn import WeatherPrediction
 
+
+
 def create_forward_fn(config):
     """Create the forward pass function with Haiku transform"""
     def forward_fn(latlon_data: dict[str, jnp.ndarray]) -> jnp.ndarray:
@@ -102,16 +104,24 @@ def train(
             input_data = {var: train_data[var][t] for var in train_data}
             # Concatenate target variables along the feature dimension
             # For each timestep:
-            target_vars = [train_data[var][t+1] for var in train_data]  # List of (n_lat, n_lon, n_pressure)
-            target_data = jnp.concatenate(target_vars, axis=0)
+            target_vars = [train_data[var][t+1] for var in train_data]
+            target_data = jnp.concatenate(target_vars, axis=-1)
             step_rng = jax.random.PRNGKey(42)
             
-            # Perform training step
-            params, opt_state, loss = train_step(params, opt_state, step_rng, input_data, target_data)
+            if epoch == 0 and t == 0:
+                start_time = time.time()
+                params, opt_state, loss = train_step(params, opt_state, step_rng, input_data, target_data)
+                compile_time = time.time() - start_time
+                logging.info(f"First step compilation time: {compile_time:.2f}s")
+            else:
+                # Perform training step
+                params, opt_state, loss = train_step(params, opt_state, step_rng, input_data, target_data)
             train_loss += loss
             
             # Update training timestep progress bar
             train_timestep_progress.set_postfix({'loss': f'{loss.item():.4f}'})
+
+        train_timestep_progress.close()
         
         # Validation phase
         val_loss = 0.0
@@ -126,9 +136,8 @@ def train(
         
         for t in val_timestep_progress:
             input_data = {var: val_data[var][t] for var in val_data}
-            # For each timestep:
-            target_vars = [train_data[var][t+1] for var in train_data]  # List of (n_lat, n_lon, n_pressure)
-            target_data = jnp.concatenate(target_vars, axis=-1)  # Shape: (n_lat, n_lon, n_vars*n_pressure)
+            target_vars = [val_data[var][t+1] for var in val_data]
+            target_data = jnp.concatenate(target_vars, axis=-1)
             
             pred = model.apply(params, input_data)
             loss = compute_loss(pred, target_data)
@@ -169,19 +178,19 @@ def train(
     return params
 
 def compute_loss(pred: jnp.ndarray, target: jnp.ndarray) -> jnp.ndarray:
-    """
-    Compute Mean Squared Error loss between prediction and ground truth
-    
-    Args:
-        pred: Model prediction of shape (n_nodes, n_features)
-        target: Ground truth of shape (n_nodes, n_features)
-    
-    Returns:
-        Scalar loss value
-    """
+    # Reshape and transpose prediction
     pred = pred.reshape(721, 1440, 78)
-    pred = jnp.transpose(pred, (2, 0, 1))
+    pred = jnp.transpose(pred, (2, 0, 1))  # Shape: (78, 721, 1440)
+    
+    # Reshape and transpose target to match prediction's shape
+    target = target.reshape(721, 1440, 78)
+    target = jnp.transpose(target, (2, 0, 1))  # Shape: (78, 721, 1440)
+    
     return jnp.mean(jnp.square(pred - target))
+# def compute_loss(pred: jnp.ndarray, target: jnp.ndarray) -> jnp.ndarray:
+#     pred = pred.reshape(721, 1440, 78)
+#     pred = jnp.transpose(pred, (2, 0, 1))
+#     return jnp.mean(jnp.square(pred - target))
 
 def main(config_path: str, dataset_path:str):
     # Setup logging

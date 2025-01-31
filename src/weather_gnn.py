@@ -124,6 +124,7 @@ class WeatherPrediction(hk.Module):
         original_n_lat = sample_var.shape[-2]
         original_n_lon = sample_var.shape[-1]
         # Create spatial graph
+        logging.info("Creating input spatial graph...")
         input_graph = create_spatial_nodes(
             latlon_data, 
             self.config.n_lat, 
@@ -131,6 +132,7 @@ class WeatherPrediction(hk.Module):
             self.config.n_features
         )
 
+        logging.info("Creating output spatial graph...")
         output_graph = create_spatial_nodes(
             latlon_data, 
             original_n_lat, 
@@ -138,25 +140,32 @@ class WeatherPrediction(hk.Module):
             self.config.n_features
         )
         
+        logging.info("Projecting input / output node features to target dimensionalities...")
         # Project spatial features to prevent dimensionality mismatches during message passing
         input_nodes_projected = self.spatial_proj(input_graph.nodes)
         input_graph = input_graph._replace(nodes=input_nodes_projected)
         output_nodes_projected = self.spatial_proj(output_graph.nodes)
         output_graph = output_graph._replace(nodes=output_nodes_projected)
         
+        logging.info("Creating sphere graph...")
         # Create sphere graph
         sphere_graph = create_sphere_nodes(
             self.config.n_sphere_points,
             self.config.latent_size
         )
         
+        logging.info("Applying encoder to input graph...")
         # Process through components
         encoded_graph = self.encoder(input_graph, sphere_graph)
+        logging.info("Applying processor to encoder output...")
         processed_graph = self.processor(encoded_graph)
+        logging.info("Applying decoder to processor output...")
         decoded_graph = self.decoder(output_graph, processed_graph, original_n_lat, original_n_lon)
+
+        logging.info("Performing final projection back to input space...")
         # Add final projection to match target features
         predictions = self.output_proj(decoded_graph.nodes)
-        
+        logging.info("Done. Returning t+1 prediction for this epoch.")
         return predictions
 
 class ProcessorCNN(hk.Module):
